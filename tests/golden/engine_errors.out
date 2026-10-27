@@ -1,0 +1,2 @@
+a := x^2/2
+Error, numeric exception: division by zero

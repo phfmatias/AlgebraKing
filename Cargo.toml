@@ -1,0 +1,22 @@
+[package]
+name = "algebraking"
+version = "0.0.1"
+edition = "2021"
+authors = ["Pedro H.F Matias <pedrohfmatias@gmail.com>"]
+description = "Symbolic math with Maple-style language, SymPy engine and an MCP server."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "algebraking"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+rustyline = "19"
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
+
+[profile.release]
+opt-level = 3

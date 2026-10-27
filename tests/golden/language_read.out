@@ -1,0 +1,13 @@
+harness loaded
+  [ OK ] one minus one
+  [FAIL] two: 2
+1
+1, 0
+3
+[f(1, 3, z), f(2, 4, z)]
+[1, 4, 9]
+Matrix(2, 2, [[2, 4], [6, 8]])
+2
+true
+caught: could not open `tests/golden/include/no_such_file.mpl` for reading
+h, "bad value 7"
