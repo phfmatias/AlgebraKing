@@ -20,3 +20,6 @@ __pycache__/
 
 # assets/crown_mask.png is tracked on purpose: it is the cached crown that lets
 # assets/make_logo.py run without the external ConvergKing.png source.
+
+# session logs (local only)
+docs/sessoes/
