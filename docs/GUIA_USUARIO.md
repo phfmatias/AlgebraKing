@@ -826,46 +826,160 @@ binário (o JSON não expande `~`):
 
 Reinicie o Claude Desktop depois de salvar.
 
-### As 7 ferramentas
+### As 8 ferramentas
 
 Todas aceitam sintaxe Maple. Os argumentos com `?` são opcionais. `session?` escolhe uma
-sessão nomeada (padrão `"main"`).
+sessão nomeada (padrão `"main"`). Todas as ferramentas de conferência aceitam `field?`: `real`
+(padrão, porque contas de física e química usam variáveis reais) ou `complex`.
 
 | Ferramenta | Argumentos | O que faz |
 |---|---|---|
 | `algebra_eval` | `code`, `session?` | executa instruções Maple numa sessão persistente e devolve cada resultado em 1-D, mais o LaTeX do último |
-| `verify_equal` | `lhs`, `rhs`, `assumptions?`, `session?` | decide se `lhs = rhs`: veredito, método, diferença e contraexemplo |
-| `check_derivative` | `f`, `derivative`, `var` (+ `assumptions?`, `session?`) | confere se `diff(f, var)` é a derivada declarada |
-| `check_integral` | `integrand`, `antiderivative`, `var` (+ `assumptions?`, `session?`) | confere se `diff(antiderivative, var)` é o integrando (primitiva correta a menos de constante) |
-| `check_solution` | `equations`, `solution` (+ `assumptions?`, `session?`) | substitui a solução declarada em cada equação e verifica |
-| `check_ode_solution` | `ode`, `solution`, `func` (+ `assumptions?`, `session?`) | como `odetest`: substitui na EDO e nas condições iniciais |
+| `verify_equal` | `lhs`, `rhs`, `assumptions?`, `field?`, `session?` | decide se `lhs = rhs` no domínio comum: veredito, método, condições, domínio de cada lado, diferença, contraexemplo dentro do domínio, sugestão de hipótese e limitações |
+| `check_derivative` | `f`, `derivative`, `var` (+ `assumptions?`, `field?`, `session?`) | confere se `diff(f, var)` é a derivada declarada |
+| `check_integral` | `integrand`, `antiderivative`, `var` (+ `assumptions?`, `field?`, `session?`) | confere se `diff(antiderivative, var)` é o integrando (primitiva correta a menos de constante) |
+| `check_solution` | `equations`, `solution` (+ `assumptions?`, `field?`, `session?`) | confere cada candidata na equação **original** e no seu domínio, lista as rejeitadas e diz se as aceitas são todas as soluções |
+| `check_step` | `before`, `after`, `var?` (+ `assumptions?`, `field?`, `session?`) | classifica um passo de resolução: equivalente, implica (soluções espúrias), é implicado (soluções perdidas), não equivalente ou indeterminado |
+| `check_ode_solution` | `ode`, `solution`, `func` (+ `assumptions?`, `field?`, `session?`) | como `odetest`: substitui na EDO e nas condições iniciais |
 | `algebra_reset` | `session?` | `restart` da sessão |
 
 `assumptions` é uma string como `"x>0, n::integer"`. Em `check_solution`, `equations` pode ser
-uma equação ou um conjunto (`{x+y=3, x-y=1}`); uma expressão `e` significa `e = 0`. Em
+uma equação ou um conjunto (`{x+y=3, x-y=1}`); uma expressão `e` significa `e = 0`; `solution`
+é uma candidata (`x=2`, `{x=2, y=1}`) ou várias (`[x=0, x=3]`, `[{x=1, y=2}, {x=2, y=1}]`). Em
 `check_ode_solution`, a EDO pode vir num conjunto com condições iniciais.
+
+#### Campos da resposta
+
+A primeira linha é sempre `verdict: equal | not_equal | undetermined`, mas o veredito sozinho
+não basta. Leia também:
+
+| Campo | Significado |
+|---|---|
+| `method` | `symbolic` (prova), `numeric` (amostragem), `convergence`, `solveset`, `domain` |
+| `field` | corpo usado: `real` ou `complex` |
+| `conditions` | condições de existência do domínio comum, em sintaxe Maple (`x <> 1`, `abs(x) < 1`, `sin(x) <> 0`). `equal` vale **só** onde elas valem |
+| `domain` | domínio de cada lado, o comum e se os dois lados têm o mesmo domínio natural (`same domain: no, they differ where x = 1`) |
+| `counterexample` | só aparece com ponto **dentro** do domínio comum, com os valores de cada lado |
+| `outside the common real domain` | ponto em que um lado é real e está no seu domínio, e o outro não é real (por exemplo `2*ln(x)` com `x < 0`) |
+| `suggestion` | hipótese sob a qual a igualdade foi **provada simbolicamente** (`equal if x >= 0`); não muda o veredito |
+| `note` / `limitation` | explicações e o que não foi provado (amostragem, convergência, conjuntos que o `solveset` não resolveu) |
+| `assumptions used` | as hipóteses da sessão e do argumento `assumptions` |
+
+`sum`, `product` e `int` chegam ao motor **inertes** (`Sum`, `Product`, `Int`) nas ferramentas de
+conferência, para que a condição de convergência não se perca; em `algebra_eval` e no REPL
+continuam devolvendo a forma fechada, como o Maple.
 
 #### Exemplos de pedido e resposta real
 
-**`verify_equal`** — *"Confere se sin(2x) é igual a 2 sin(x) cos(x)."*
+**`verify_equal`** — *"Confere se (x^2-1)/(x-1) é igual a x+1."*
 
 ```text
 verdict: equal
 method: symbolic
+field: real
+conditions: x <> 1 (the result holds only where these hold)
+domain: lhs: x <> 1; rhs: all real numbers; common: x <> 1; same domain: no, they differ where x = 1
 difference lhs - rhs: 0
-lhs: sin(2*x)
-rhs: 2*sin(x)*cos(x)
+note: equal where both sides are defined; the domains differ where x = 1
+lhs: (x^2-1)/(x-1)
+rhs: x+1
 ```
 
-Com hipótese — *"Confere se sqrt(x^2) = x supondo x>0"* (`assumptions: "x>0"`) dá `equal`
-(simbólico). Sem a hipótese:
+*"sqrt(x^2) = x?"* — sem hipótese o contraexemplo está dentro do domínio, e a ferramenta sugere
+a hipótese que torna a identidade verdadeira:
 
 ```text
 verdict: not_equal
 method: numeric
-difference lhs - rhs: -x+sqrt(x^2)
-counterexample: x = -2.1
+field: real
+conditions: none
+domain: lhs: all real numbers; rhs: all real numbers; common: all real numbers; same domain: yes
+difference lhs - rhs: -x+abs(x)
+counterexample: x = -2.1 (inside the common domain); lhs = 2.1, rhs = -2.1
+suggestion: equal if x >= 0 -- found by trying a fixed menu of assumptions; the equality under it is a symbolic proof
+note: the counterexample lies inside the common domain
 ```
+
+Com `assumptions: "x>0"` o resultado é `equal`, método `symbolic`, com
+`assumptions used: x > 0`.
+
+*"ln(x^2) = 2 ln(x)?"* — no domínio comum (`x > 0`) os lados coincidem, mas para `x < 0` o lado
+esquerdo é real e o direito não:
+
+```text
+verdict: not_equal
+method: numeric
+field: real
+conditions: x > 0 (the result holds only where these hold)
+domain: lhs: x <> 0; rhs: x > 0; common: x > 0; same domain: no, they differ where x < 0
+difference lhs - rhs: -2*ln(x)+ln(x^2)
+outside the common real domain: at x = -2.1 lhs = 1.483874689, rhs = 1.483874689+6.283185307*I
+suggestion: equal if x > 0 -- found by trying a fixed menu of assumptions; the equality under it is a symbolic proof
+note: the sides agree on the common real domain, but at x = -2.1 the lhs is real and in its domain while the rhs is not real (outside its real domain) and has a different value
+note: over the reals the rhs requires x > 0, the lhs only x <> 0
+```
+
+A identidade válida é `ln(x^2) = 2*ln(abs(x))`: sai `equal`, `conditions: x <> 0`,
+`same domain: yes`.
+
+*"sum(x^n, n=0..infinity) = 1/(1-x)?"* — a série só converge para `abs(x) < 1`:
+
+```text
+verdict: equal
+method: symbolic
+field: real
+conditions: abs(x) < 1 (the result holds only where these hold)
+domain: lhs: abs(x) < 1; rhs: x <> 1; common: abs(x) < 1; same domain: no, they differ where x <= -1 or x > 1
+difference lhs - rhs: 0
+note: Sum(x^n, n = 0 .. infinity) = 1/(1-x) only where abs(x) < 1 (convergence condition)
+note: Sum(x^n, n = 0 .. infinity) diverges at x = -1 (boundary), x = 1 (boundary), x = -2, x = 2
+note: equal where both sides are defined; the domains differ where x <= -1 or x > 1
+limitation: divergence outside abs(x) < 1 was checked only at the listed points, not proved
+lhs: Sum(x^n, n = 0 .. infinity)
+rhs: 1/(-x+1)
+```
+
+Identidades trigonométricas com polos trazem a condição: `(1-cos(x)^2)/sin(x)^2 = 1` sai `equal`
+com `conditions: sin(x) <> 0` e a nota `sin(x) <> 0: excludes x = Pi*_Z1 (_Z1 integer)` (`_Z1`
+é um inteiro qualquer, como no Maple).
+
+**`check_step`** — *"Confere o passo: de sqrt(x+1) = x-1 elevei ao quadrado e cheguei em
+x+1 = (x-1)^2."* (`before: "sqrt(x+1) = x-1"`, `after: "x+1 = (x-1)^2"`)
+
+```text
+classification: implies (every solution of before solves after, but after has extra (spurious) solutions)
+solutions before: x = 3
+solutions after: x = 0, x = 3
+spurious solutions (added by the step): x = 0
+verdict: not_equal
+method: solveset
+field: real
+conditions: x >= -1 (domain of the equations)
+domain: before: x >= -1; after: all real numbers
+note: the new equation is the old one squared (lhs^2 = rhs^2); squaring adds the solutions of lhs = -rhs, so those must be rejected by checking them in the original equation
+before: sqrt(x+1) = x-1
+after: x+1 = (x-1)^2
+```
+
+Dividir pela incógnita perde soluções (`x^2 = x` para `x = 1`):
+
+```text
+classification: implied_by (every solution of after solves before, but solutions of before are lost)
+solutions before: x = 0, x = 1
+solutions after: x = 1
+lost solutions: x = 0
+...
+note: the step divides by x, which vanishes at solutions of the original equation; those solutions are lost
+```
+
+Famílias infinitas aparecem como famílias, nunca como listas finitas: de `sin(x) = 0` para
+`x = 0` sai `implied_by` com `solutions before: x = Pi*_Z1 (_Z1 integer)` e
+`lost solutions: x = Pi*_Z1 (_Z1 integer) except x = 0`. Quando o `solveset` não resolve uma das
+equações (devolve `ConditionSet`, como em `exp(x) = x+2`), a classificação é `undetermined`, com
+o motivo. Com duas expressões (sem `=`), o passo é uma reescrita e é conferido como no
+`verify_equal`, com domínios. Parâmetros além de `var` são tratados como genéricos pelo
+`solveset`; o relatório avisa, e um fator só dos parâmetros aparece na nota (`a*x = a*b` para
+`x = b` perde todo `x` quando `a = 0`).
 
 **`check_derivative`** — *"Confere se a derivada de x*exp(x) é exp(x)."*
 
@@ -874,8 +988,12 @@ The claimed derivative is WRONG.
 computed diff(f, x): x*exp(x)+exp(x)
 verdict: not_equal
 method: numeric
+field: real
+conditions: none
+domain: lhs: all real numbers; rhs: all real numbers; common: all real numbers; same domain: yes
 difference lhs - rhs: x*exp(x)
-counterexample: x = -2.1
+counterexample: x = -2.1 (inside the common domain); lhs = -0.1347020711, rhs = 0.1224564283
+note: the counterexample lies inside the common domain
 ```
 
 E com `(x+1)*exp(x)`: `The claimed derivative is correct.` (`verdict: equal`, `method: symbolic`).
@@ -887,28 +1005,37 @@ The antiderivative is correct (up to an additive constant).
 diff(antiderivative, x): x*cos(x)
 verdict: equal
 method: symbolic
+field: real
+conditions: none
+domain: lhs: all real numbers; rhs: all real numbers; common: all real numbers; same domain: yes
 difference lhs - rhs: 0
 ```
 
-**`check_solution`** — *"Confere se x=2, y=1 resolve o sistema x+y=3, x-y=1."*
-(`equations: "{x+y=3, x-y=1}"`, `solution: "{x=2, y=1}"`)
+**`check_solution`** — *"Confere se x=0 e x=3 resolvem sqrt(x+1) = x-1."*
+(`equations: "sqrt(x+1) = x-1"`, `solution: "[x=0, x=3]"`)
 
 ```text
-The solution satisfies every equation.
-equation 1: x+y = 3
-  after substitution: 3 = 3
-  verdict: equal
-  method: symbolic
-  difference lhs - rhs: 0
-equation 2: x-y = 1
-  after substitution: 1 = 1
-  verdict: equal
-  method: symbolic
-  difference lhs - rhs: 0
+Some candidates are REJECTED: x = 0.
+equation 1: sqrt(x+1) = x-1
+candidate x = 0: rejected
+  equation 1: not satisfied: lhs = 1, rhs = -1
+candidate x = 3: accepted
+  equation 1: satisfied: lhs - rhs simplifies to 0
+all solutions over the reals: x = 3
+completeness: the accepted candidates are all the solutions over the reals
+verdict: not_equal
+method: symbolic
+field: real
+conditions: x >= -1 (domain of the equations)
 ```
 
-E *"x=4 resolve x^2-5x+6=0?"*: `The solution does NOT satisfy every equation.` com
-`after substitution: 2 = 0`.
+Uma candidata fora do domínio é rejeitada mesmo que a conta "feche" depois de simplificar:
+`x = 1` em `(x^2-1)/(x-1) = 2` dá `outside domain: the condition x-1 <> 0 of the original
+equation fails`. Para `sin(x) = 0` com `[x=0, x=Pi]`, as duas são aceitas, mas a completude diz
+`the equation has infinitely many solutions over the reals (x = Pi*_Z1 (_Z1 integer)); a finite
+list of candidates cannot be complete`. Sistema `{x+y=3, x-y=1}` com `{x=2, y=1}`:
+`The solution satisfies every equation.` e `completeness: the accepted candidates are all the
+solutions of the polynomial system`.
 
 **`check_ode_solution`** — *"Confere se y(x)=3 sin(x)+2 cos(x) resolve y''+y=0."*
 (`ode: "diff(y(x),x,x)+y(x)=0"`, `solution: "y(x)=3*sin(x)+2*cos(x)"`, `func: "y(x)"`)
@@ -919,6 +1046,9 @@ condition 1: diff(y(x), x, x)+y(x) = 0
   after substitution: 0 = 0
   verdict: equal
   method: symbolic
+  field: real
+  conditions: none
+  domain: lhs: all real numbers; rhs: all real numbers; common: all real numbers; same domain: yes
   difference lhs - rhs: 0
 ```
 
@@ -934,19 +1064,44 @@ LaTeX: x^{2} \cos{\left(x \right)} + 2 x \sin{\left(x \right)}
 
 ### Como o veredito funciona
 
-`verify_equal` (e todas as ferramentas `check_*`, que a usam por baixo) segue este roteiro:
+`verify_equal` (e as ferramentas `check_derivative`, `check_integral`, `check_ode_solution` e
+`check_step` com duas expressões, que a usam por baixo) segue este roteiro, sobre o corpo pedido
+(`real` por padrão):
 
-1. Para listas, conjuntos, equações e matrizes, compara elemento a elemento.
-2. Calcula `d = lhs - rhs` e tenta provar `d = 0` simbolicamente (`expand`, `cancel`,
-   `simplify`, `trigsimp`, `radsimp`), sob as suposições da sessão. Zero → **`equal`**, método
-   **`symbolic`**.
-3. Senão, faz um teste numérico: 12 pontos aleatórios para as variáveis livres (reais em
-   [-3, 3] e alguns complexos com |z| ≤ 2, respeitando suposições como `x>0`), avaliados com
-   mpmath a 40 dígitos. Todos nulos dentro da tolerância → **`equal`** com método
-   **`numeric`**, e a resposta avisa: *numerical check at random points, not a symbolic
-   proof*. Um ponto claramente não nulo → **`not_equal`** com esse ponto como
-   **contraexemplo**.
-4. Caso contrário, **`undetermined`**. O programa nunca levanta erro por motivo matemático.
+1. Para listas, conjuntos, equações e matrizes, compara elemento a elemento (sem análise de
+   domínio; o relatório avisa).
+2. `Sum`, `Product` e `Int` são calculados guardando a condição do SymPy (`abs(x) < 1`); a
+   convergência na fronteira e em dois pontos de fora é testada e relatada. Série divergente não
+   tem valor; série cuja convergência não se decide nunca dá `equal`.
+3. Coleta as condições de existência de cada lado: denominadores `<> 0`, argumento de `ln`
+   (`> 0` nos reais, `<> 0` nos complexos), raízes e potências fracionárias (`>= 0` nos reais),
+   polos de `tan`, `cot`, `sec`, `csc`, faixas de `arcsin`, `arccos`, `arctanh` etc. Condições já
+   garantidas pelas hipóteses somem. Os conjuntos excluídos vêm do `solveset`; quando ele não
+   resolve, a condição fica simbólica e uma limitação avisa.
+4. Tenta provar `lhs - rhs = 0` simbolicamente no domínio comum (as condições simples, como
+   `x > 0`, viram hipóteses). Zero → **`equal`**, método **`symbolic`**.
+5. Teste numérico: pontos aleatórios a 40 dígitos, **só** onde os dois lados existem (e são reais,
+   no corpo real) e satisfazem as condições. Um ponto claramente diferente → **`not_equal`** com
+   esse ponto como contraexemplo. Um ponto em que um lado é real e o outro não → **`not_equal`**
+   explicado (`outside the common real domain`). Todos iguais → `equal` numérico.
+6. `equal` significa igual no domínio comum; se os domínios diferem (`x = 1` excluído só à
+   esquerda, por exemplo), o relatório diz onde.
+7. Se o veredito não é `equal` e há no máximo 2 variáveis, tenta um cardápio fixo de hipóteses
+   (`x >= 0`, `x > 0`, `x < 0`, `x::integer`) e, se alguma der prova simbólica, mostra
+   `suggestion`. O veredito principal não muda.
+8. Caso contrário, **`undetermined`**. O programa nunca levanta erro por motivo matemático.
+
+**O que é prova e o que é heurística.** É prova: `equal` com método `symbolic`, sob as
+`conditions` listadas e as hipóteses declaradas; a `suggestion` também é prova simbólica sob a
+hipótese sugerida, mas a escolha da hipótese é heurística (um cardápio fixo, não uma busca
+completa). É heurística: `equal` numérico (pontos de amostra), a divergência fora da condição de
+uma série (testada em pontos), a comparação de domínios com duas ou mais variáveis e a
+classificação de `check_step` quando há parâmetros (o `solveset` os trata como genéricos). O
+`check_step` e a completude do `check_solution` dependem do `solveset`: quando ele devolve
+`ConditionSet`, a resposta é `undetermined` / *not established*, nunca um palpite. Por fim, como
+no Maple, a linguagem simplifica automaticamente `x/x` para `1` e `sqrt(x)^2` para `x`; a
+ferramenta recupera essas condições lendo a entrada antes da avaliação, mas não quando a
+expressão vem de uma variável já atribuída na sessão.
 
 **`equal` numérico é evidência forte, não prova.** Exemplo real: `erf(x)+erfc(x) = 1` sai
 `equal` por método `numeric`, e está certo. Mas `sin(x)*Heaviside(x)` contra
@@ -954,6 +1109,9 @@ LaTeX: x^{2} \cos{\left(x \right)} + 2 x \sin{\left(x \right)}
 [-3, 3] e a diferença só aparece para x > π (em `x = 4` as duas expressões valem `sin(4)` e
 `-sin(4)`). Desconfie de identidades com funções definidas por partes, ramos ou comportamento
 em regiões distantes. `symbolic` + `equal` é a única resposta que vale como demonstração.
+
+A função `verify(a, b)` da linguagem (REPL e scripts) continua devolvendo só `true`, `false` ou
+`FAIL`, com o algoritmo antigo (sem corpo nem domínio).
 
 ### Sessões
 
@@ -1077,10 +1235,10 @@ vinda de um projeto de pesquisa (todas as 257 conferências deram o mesmo veredi
 Suítes de teste do repositório (executadas para escrever este guia):
 
 ```bash
-cargo test --release                       # 38 testes: 26 unitários + 7 de CLI/golden + 5 de MCP, todos passando
-python3 -m unittest engine/test_engine.py  # Ran 248 tests ... OK
+cargo test --release                       # 39 testes: 26 unitários + 7 de CLI/golden + 6 de MCP, todos passando
+python3 -m unittest engine/test_engine.py  # Ran 287 tests ... OK
 ```
 
 Os testes "golden" (`tests/golden/*.mpl` e `*.out`) comparam a saída do binário com a saída
-esperada; os de MCP exercitam o handshake, as 7 ferramentas, o timeout e a reinicialização do
+esperada; os de MCP exercitam o handshake, as 8 ferramentas, o timeout e a reinicialização do
 motor.

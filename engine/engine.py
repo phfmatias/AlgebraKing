@@ -19,6 +19,7 @@ import random
 import re
 import signal
 import sys
+import time
 import traceback
 import warnings
 
@@ -2174,7 +2175,11 @@ class VerifyMixin(object):
             return {'ok': False, 'error': self.errMsg('verify', str(exc))}
         except (KeyError, TypeError, ValueError, IndexError) as exc:
             return {'ok': False, 'error': self.errMsg('verify', str(exc))}
+        field = (req.get('opts') or {}).get('field')
         try:
+            if field in FIELD_SETS:
+                raws = ([req['lhs'], req.get('lhs_raw')], [req['rhs'], req.get('rhs_raw')])
+                return {'ok': True, 'result': self.richVerify(L, R, field, req.get('opts'), raws)}
             res = self.verifyAny(L, R)
             out = {'verdict': res['verdict'], 'method': res['method']}
             if res.get('difference') is not None:
@@ -2529,6 +2534,1575 @@ class VerifyMixin(object):
                 vs.extend([sp.sstr(v)] * int(n))
             return 'diff({}, {})'.format(self.atomKey(at.expr) if isinstance(at.expr, sp.core.function.AppliedUndef) else sp.sstr(at.expr), ', '.join(vs))
         return sp.sstr(at)
+
+
+# ----------------------------------------------------------------------------
+# domain analysis: where each side exists (used by verify, check_step and check_solution)
+# ----------------------------------------------------------------------------
+
+INERT_KINDS = (sp.Sum, sp.Product, sp.Integral)
+RAW_SKIP = {'sum', 'Sum', 'int', 'Int', 'product', 'Product', 'limit', 'Limit', 'piecewise', 'diff', 'Diff', 'D'}
+RAW_FUNCS = {'ln': sp.log, 'log': sp.log, 'log10': sp.log, 'log2': sp.log, 'tan': sp.tan, 'cot': sp.cot,
+             'sec': sp.sec, 'csc': sp.csc, 'coth': sp.coth, 'csch': sp.csch, 'arcsin': sp.asin, 'arccos': sp.acos,
+             'arcsec': sp.asec, 'arccsc': sp.acsc, 'arctanh': sp.atanh, 'arccoth': sp.acoth, 'arccosh': sp.acosh}
+RAW_CONSTS = {'Pi', 'I', 'infinity'}
+FIELD_SETS = {'real': sp.S.Reals, 'complex': sp.S.Complexes}
+FAMILY_INDEX = '_Z1'
+
+
+def negTerm(e):
+    """Positive counterpart of a negative EXPR term, else None."""
+    if not isinstance(e, dict):
+        return None
+    if 'int' in e and e['int'].startswith('-'):
+        return {'int': e['int'][1:]}
+    if 'rat' in e and e['rat'][0].startswith('-'):
+        return {'rat': [e['rat'][0][1:], e['rat'][1]]}
+    if 'float' in e and e['float'].startswith('-'):
+        return {'float': e['float'][1:], 'digits': e.get('digits')}
+    if 'mul' in e and e['mul']:
+        nf = negTerm(e['mul'][0])
+        if nf is not None:
+            rest = e['mul'][1:]
+            if nf.get('int') == '1':
+                if not rest:
+                    return nf
+                return rest[0] if len(rest) == 1 else {'mul': rest}
+            return {'mul': [nf] + rest}
+    return None
+
+
+def isNumNode(e):
+    return isinstance(e, dict) and any(k in e for k in ('int', 'rat', 'float', 'const'))
+
+
+def exprText(e, ctx=0):
+    """Maple 1-D text of an EXPR tree. ctx: 0 top, 1 add term, 2 mul factor, 3 pow base, 4 exponent."""
+    if not isinstance(e, dict):
+        return str(e)
+    if 'int' in e:
+        s = e['int']
+        return '({})'.format(s) if s.startswith('-') and ctx >= 2 else s
+    if 'rat' in e:
+        s = '{}/{}'.format(*e['rat'])
+        return '({})'.format(s) if ctx >= 2 else s
+    if 'float' in e:
+        s = e['float']
+        return '({})'.format(s) if s.startswith('-') and ctx >= 2 else s
+    if 'sym' in e:
+        return e['sym']
+    if 'idx' in e:
+        return '{}[{}]'.format(exprText(e['idx'][0]), ', '.join(exprText(i) for i in e['idx'][1]))
+    if 'str' in e:
+        return '"{}"'.format(e['str'])
+    if 'bool' in e:
+        return 'true' if e['bool'] else 'false'
+    if 'fail' in e:
+        return 'FAIL'
+    if 'const' in e:
+        return e['const']
+    if 'add' in e:
+        out = ''
+        for i, t in enumerate(e['add']):
+            n = negTerm(t)
+            if n is not None:
+                out += '-' + exprText(n, 1)
+            else:
+                out += ('+' if i else '') + exprText(t, 1)
+        return '({})'.format(out) if ctx >= 2 else out
+    if 'mul' in e:
+        facs = list(e['mul'])
+        sign = ''
+        neg = negTerm(facs[0]) if facs else None
+        if neg is not None:
+            sign = '-'
+            facs[0] = neg
+            if neg.get('int') == '1' and len(facs) > 1:
+                facs = facs[1:]
+        nums, dens = [], []
+        for f in facs:
+            if 'pow' in f:
+                ne = negTerm(f['pow'][1])
+                if ne is not None:
+                    dens.append(f['pow'][0] if ne.get('int') == '1' else {'pow': [f['pow'][0], ne]})
+                    continue
+            if 'rat' in f:
+                p, q = f['rat']
+                if p != '1':
+                    nums.append({'int': p})
+                dens.append({'int': q})
+                continue
+            nums.append(f)
+        out = '*'.join(exprText(n, 2) for n in nums) or '1'
+        if dens:
+            if len(dens) == 1:
+                out += '/' + exprText(dens[0], 3)
+            else:
+                out += '/(' + '*'.join(exprText(x, 2) for x in dens) + ')'
+        out = sign + out
+        return '({})'.format(out) if ctx >= 2 and sign or ctx >= 3 else out
+    if 'pow' in e:
+        b, x = e['pow']
+        if x.get('rat') == ['1', '2']:
+            return 'sqrt({})'.format(exprText(b))
+        ne = negTerm(x)
+        if ne is not None:
+            inner = b if ne.get('int') == '1' else {'pow': [b, ne]}
+            s = '1/' + exprText(inner, 3)
+            return '({})'.format(s) if ctx >= 2 else s
+        s = '{}^{}'.format(exprText(b, 3), exprText(x, 4))
+        return '({})'.format(s) if ctx >= 3 else s
+    if 'fn' in e:
+        head = exprText(e['fn']) if isinstance(e['fn'], dict) else e['fn']
+        return '{}({})'.format(head, ', '.join(exprText(a) for a in e.get('args', [])))
+    if 'fnidx' in e:
+        n, idx, args = e['fnidx']
+        return '{}[{}]({})'.format(n, ', '.join(exprText(i) for i in idx), ', '.join(exprText(a) for a in args))
+    for k, sym, rev in (('eq', '=', '='), ('neq', '<>', '<>'), ('lt', '<', '>'), ('le', '<=', '>=')):
+        if k in e:
+            a, b = e[k]
+            if k in ('lt', 'le') and isNumNode(a) and not isNumNode(b):
+                return '{} {} {}'.format(exprText(b), rev, exprText(a))
+            return '{} {} {}'.format(exprText(a), sym, exprText(b))
+    if 'and' in e:
+        return ' and '.join(exprText(t, 1) if 'or' in t else exprText(t) for t in e['and'])
+    if 'or' in e:
+        s = ' or '.join(exprText(t) for t in e['or'])
+        return '({})'.format(s) if ctx >= 1 else s
+    if 'not' in e:
+        return 'not ({})'.format(exprText(e['not']))
+    if 'list' in e:
+        return '[' + ', '.join(exprText(t) for t in e['list']) + ']'
+    if 'set' in e:
+        return '{' + ', '.join(exprText(t) for t in e['set']) + '}'
+    if 'seq' in e:
+        return ', '.join(exprText(t) for t in e['seq'])
+    if 'range' in e:
+        return '{} .. {}'.format(exprText(e['range'][0]), exprText(e['range'][1]))
+    return str(e)
+
+
+def fmtValue(v):
+    """Short text of an mpmath number (real or complex)."""
+    def one(x):
+        s = mpmath.nstr(x, 10)
+        return s[:-2] if s.endswith('.0') else s
+    if abs(v.imag) <= 1e-30 * max(1, abs(v)):
+        return one(v.real)
+    if abs(v.real) <= 1e-30 * max(1, abs(v)):
+        return '{}*I'.format(one(v.imag))
+    return '{}{}{}*I'.format(one(v.real), '+' if v.imag > 0 else '-', one(abs(v.imag)))
+
+
+def hasFamily(S):
+    return isinstance(S, sp.Basic) and S.has(sp.ImageSet)
+
+
+def undoComplement(X):
+    """Complement(A, Complement(A, Z)) -> Intersection(A, Z), also inside unions."""
+    if isinstance(X, sp.Union):
+        return sp.Union(*[undoComplement(a) for a in X.args])
+    if isinstance(X, sp.Complement) and isinstance(X.args[1], sp.Complement) and X.args[0] == X.args[1].args[0]:
+        Z = X.args[1].args[1]
+        return Z if X.args[0] in (sp.S.Reals, sp.S.Complexes) else sp.Intersection(X.args[0], Z)
+    return X
+
+
+class DomainMixin(object):
+    """Existence conditions of expressions over the reals or the complexes, and solution sets as text."""
+
+    def mText(self, e):
+        try:
+            return exprText(self.cv.toExpr(e))
+        except (MapleError, TypeError, ValueError, KeyError, AttributeError, IndexError):
+            return sp.sstr(e)
+
+    def newSym(self, s, extra, field):
+        props = dict(self.assume.props.get(s.name, {}))
+        if field == 'real' and not props.get('imaginary'):
+            props['real'] = True
+        props.update(extra)
+        try:
+            ns = sp.Symbol(s.name, **props)
+            ns.is_real, ns.is_positive, ns.is_negative, ns.is_zero
+            return ns
+        except (ValueError, TypeError, InconsistentAssumptions):
+            return None
+
+    def fieldRep(self, exprs, field):
+        """Real field: every free symbol becomes real (session assumptions kept)."""
+        rep = {}
+        if field != 'real':
+            return rep
+        for e in exprs:
+            if not isinstance(e, sp.Basic):
+                continue
+            for s in e.free_symbols:
+                if s in rep or not isinstance(s, sp.Symbol) or isinstance(s, (sp.Dummy, IdxSym)):
+                    continue
+                if s.is_real or s.is_imaginary:
+                    continue
+                ns = self.newSym(s, {}, field)
+                if ns is not None:
+                    rep[s] = ns
+        return rep
+
+    # ---- existence conditions ----
+
+    def normCond(self, c, field):
+        """Split and tidy one condition; returns a list of SymPy booleans (True ones dropped)."""
+        if c is sp.true or c is True:
+            return []
+        if isinstance(c, sp.And):
+            out = []
+            for t in c.args:
+                out.extend(self.normCond(t, field))
+            return out
+        if isinstance(c, sp.Ne):
+            f = c.lhs - c.rhs
+            if f.is_number:
+                return [] if f.is_zero is False or (f.is_zero is None and abs(sp.N(f)) > 1e-30) else [sp.false]
+            f = sp.factor_terms(f)
+            if isinstance(f, sp.Mul):
+                out = []
+                for t in f.args:
+                    if not t.is_number:
+                        out.extend(self.normCond(sp.Ne(t, 0), field))
+                return out
+            if isinstance(f, sp.Pow) and f.exp.is_positive:
+                return self.normCond(sp.Ne(f.base, 0), field)
+            if isinstance(f, sp.Abs):
+                return self.normCond(sp.Ne(f.args[0], 0), field)
+            if f.could_extract_minus_sign():
+                f = -f
+            c = sp.Ne(f, 0)
+        elif isinstance(c, (sp.StrictGreaterThan, sp.GreaterThan, sp.StrictLessThan, sp.LessThan)):
+            big, small = c.gts, c.lts
+            strict = isinstance(c, (sp.StrictGreaterThan, sp.StrictLessThan))
+            if field == 'real' and strict and small == sp.Abs(sp.arg(small.args[0].args[0])) \
+                    if isinstance(small, sp.Abs) and isinstance(small.args[0], sp.arg) else False:
+                u = small.args[0].args[0]
+                if u.is_real and big == sp.pi / 2:
+                    # real u: arg(u) is 0 for u > 0 and Pi for u < 0
+                    return self.normCond(sp.Gt(u, 0), field)
+            if small == 0 and field == 'real':
+                g = big
+                if isinstance(g, sp.Pow) and g.exp.is_even:
+                    return self.normCond(sp.Ne(g.base, 0), field) if strict else []
+                if isinstance(g, sp.Abs):
+                    return self.normCond(sp.Ne(g.args[0], 0), field) if strict else []
+        if c is sp.true:
+            return []
+        return [c]
+
+    def condsOf(self, e, field):
+        """Existence conditions read from the expression tree."""
+        out = []
+        limits = []
+
+        def add(c):
+            for t in self.normCond(c, field):
+                if t is sp.true:
+                    continue
+                if not any(t == o for o in out):
+                    out.append(t)
+        if not isinstance(e, sp.Basic):
+            return out, limits
+        it = sp.preorder_traversal(e)
+        for sub in it:
+            if isinstance(sub, INERT_KINDS):
+                it.skip()
+                continue
+            if isinstance(sub, sp.Piecewise):
+                good = [c for ex, c in sub.args if ex is not sp.nan]
+                if len(good) < len(sub.args):
+                    add(sp.Or(*good) if good else sp.false)
+                if len(good) > 1:
+                    limits.append('conditions inside the branches of a piecewise expression are not analysed')
+                it.skip()
+                continue
+            self.nodeConds(sub, field, add)
+        return out, limits
+
+    def nodeConds(self, sub, field, add):
+        """Existence conditions contributed by one node (not its children)."""
+        if isinstance(sub, sp.Pow):
+            b, x = sub.base, sub.exp
+            if b.is_number and (b.is_positive or b == sp.E):
+                return
+            if x.is_integer:
+                if not x.is_nonnegative:
+                    add(sp.Ne(b, 0))
+            elif x.is_number:
+                if field == 'real':
+                    add(sp.Gt(b, 0) if x.is_negative else sp.Ge(b, 0))
+                elif x.is_negative:
+                    add(sp.Ne(b, 0))
+            elif not b.is_number:
+                if field == 'real':
+                    add(sp.Gt(b, 0))
+                elif not x.is_positive:
+                    add(sp.Ne(b, 0))
+            return
+        if isinstance(sub, sp.log):
+            a = sub.args[0]
+            add(sp.Gt(a, 0) if field == 'real' else sp.Ne(a, 0))
+        elif isinstance(sub, (sp.tan, sp.sec)):
+            add(sp.Ne(sp.cos(sub.args[0]), 0))
+        elif isinstance(sub, (sp.cot, sp.csc)):
+            add(sp.Ne(sp.sin(sub.args[0]), 0))
+        elif isinstance(sub, (sp.coth, sp.csch)):
+            a = sub.args[0]
+            add(sp.Ne(a, 0) if field == 'real' else sp.Ne(sp.sinh(a), 0))
+        elif isinstance(sub, (sp.asin, sp.acos)) and field == 'real':
+            add(sp.Le(sp.Abs(sub.args[0]), 1))
+        elif isinstance(sub, (sp.asec, sp.acsc)):
+            a = sub.args[0]
+            add(sp.Ge(sp.Abs(a), 1) if field == 'real' else sp.Ne(a, 0))
+        elif isinstance(sub, sp.atanh):
+            a = sub.args[0]
+            if field == 'real':
+                add(sp.Lt(sp.Abs(a), 1))
+            else:
+                add(sp.Ne(a, 1))
+                add(sp.Ne(a, -1))
+        elif isinstance(sub, sp.acoth):
+            a = sub.args[0]
+            if field == 'real':
+                add(sp.Gt(sp.Abs(a), 1))
+            else:
+                add(sp.Ne(a, 1))
+                add(sp.Ne(a, -1))
+        elif isinstance(sub, sp.acosh) and field == 'real':
+            add(sp.Ge(sub.args[0], 1))
+
+    def rawConds(self, node, field):
+        """Conditions read from the request tree before automatic simplification (x/x, sqrt(x)^2 ...)."""
+        out = []
+
+        def add(c):
+            for t in self.normCond(c, field):
+                if not any(t == o for o in out):
+                    out.append(t)
+
+        def fix(n):
+            if isinstance(n, dict) and n.get('sym') in RAW_CONSTS and len(n) == 1:
+                return {'const': n['sym']}
+            if isinstance(n, dict):
+                return {k: fix(v) for k, v in n.items()}
+            if isinstance(n, list):
+                return [fix(v) for v in n]
+            return n
+
+        def walk(n):
+            if isinstance(n, list):
+                for t in n:
+                    walk(t)
+                return
+            if not isinstance(n, dict):
+                return
+            if isinstance(n.get('fn'), str) and n['fn'] in RAW_SKIP:
+                return
+            try:
+                if isinstance(n.get('fn'), str) and n['fn'] in RAW_FUNCS and len(n.get('args', [])) == 1:
+                    self.nodeConds(RAW_FUNCS[n['fn']](self.cv.toSympy(n['args'][0]), evaluate=False), field, add)
+                elif isinstance(n.get('fn'), str) and n['fn'] == 'sqrt' and len(n.get('args', [])) == 1:
+                    self.nodeConds(sp.Pow(self.cv.toSympy(n['args'][0]), sp.S.Half, evaluate=False), field, add)
+                elif 'pow' in n:
+                    b, x = [self.cv.toSympy(t) for t in n['pow']]
+                    if isinstance(b, sp.Basic) and isinstance(x, sp.Basic):
+                        self.nodeConds(sp.Pow(b, x, evaluate=False), field, add)
+            except (MapleError, TypeError, ValueError, KeyError, IndexError, AttributeError, ZeroDivisionError):
+                pass
+            for v in n.values():
+                walk(v)
+        if node is not None:
+            walk(fix(node))
+        return out
+
+    def boundsInterval(self, s):
+        """Interval allowed for a real symbol by the declared assumptions (None when unconstrained)."""
+        b = self.assume.bounds.get(s.name, {})
+        lo, hi, loO, hiO = -sp.oo, sp.oo, True, True
+        if s.is_positive:
+            lo, loO = sp.Integer(0), True
+        elif s.is_nonnegative:
+            lo, loO = sp.Integer(0), False
+        if s.is_negative:
+            hi, hiO = sp.Integer(0), True
+        elif s.is_nonpositive:
+            hi, hiO = sp.Integer(0), False
+        if 'lo' in b and b['lo'][0] >= lo:
+            lo, loO = b['lo'][0], b['lo'][1]
+        if 'hi' in b and b['hi'][0] <= hi:
+            hi, hiO = b['hi'][0], b['hi'][1]
+        if lo == -sp.oo and hi == sp.oo:
+            return None
+        return sp.Interval(lo, hi, loO, hiO)
+
+    def pruneConds(self, conds):
+        """Drop conditions that the declared bounds already guarantee (one-symbol conditions only)."""
+        out = []
+        for c in conds:
+            if c is sp.true:
+                continue
+            fs = list(c.free_symbols)
+            if len(fs) == 1 and fs[0].is_real:
+                iv = self.boundsInterval(fs[0])
+                if iv is not None:
+                    try:
+                        cs = self.condSet(c, fs[0], 'real')
+                        if cs is not None and iv.is_subset(cs) is True:
+                            continue
+                    except (NotImplementedError, TypeError, ValueError, AttributeError):
+                        pass
+            out.append(c)
+        return out
+
+    def strengthenRep(self, conds, field):
+        """Symbols restricted by simple conditions (x > 0, x <> 0, ...) get those assumptions."""
+        props = {}
+        for c in conds:
+            s, p = None, None
+            if isinstance(c, sp.Ne) and isSym(c.lhs) and c.rhs == 0:
+                s, p = c.lhs, 'nonzero'
+            elif isinstance(c, (sp.StrictGreaterThan, sp.GreaterThan, sp.StrictLessThan, sp.LessThan)):
+                strict = isinstance(c, (sp.StrictGreaterThan, sp.StrictLessThan))
+                if c.lts == 0 and isSym(c.gts):
+                    s, p = c.gts, 'positive' if strict else 'nonnegative'
+                elif c.gts == 0 and isSym(c.lts):
+                    s, p = c.lts, 'negative' if strict else 'nonpositive'
+            if s is None or isinstance(s, (sp.Dummy, IdxSym)):
+                continue
+            props.setdefault(s, {})[p] = True
+        rep = {}
+        for s, p in props.items():
+            if p.get('nonnegative') and p.get('nonzero'):
+                p = {'positive': True}
+            if p.get('nonpositive') and p.get('nonzero'):
+                p = {'negative': True}
+            ns = self.newSym(s, dict(p, **({'real': True} if field == 'real' else {})), field)
+            if ns is not None:
+                rep[s] = ns
+        return rep
+
+    # ---- sums, products and integrals with their conditions ----
+
+    def convergence(self, node):
+        try:
+            return node.is_convergent()
+        except (NotImplementedError, ValueError, TypeError, AttributeError, IndexError):
+            return None
+
+    def resolveOne(self, node):
+        """Closed form of one inert Sum/Product/Integral: (value, conds, notes, limits, status)."""
+        txt = self.mText(node)
+        kind = 'series' if isinstance(node, sp.Sum) else ('product' if isinstance(node, sp.Product) else 'integral')
+        try:
+            r = node.doit()
+        except (NotImplementedError, ValueError, TypeError, AttributeError, ZeroDivisionError):
+            r = node
+        if r in (sp.oo, -sp.oo, sp.zoo) or r is sp.nan:
+            to = ' to {}'.format(self.mText(r)) if r in (sp.oo, -sp.oo) else ''
+            return r if to else sp.nan, [], ['the {} {} diverges{}'.format(kind, txt, to)], [], 'divergent'
+        if isinstance(r, sp.Piecewise):
+            good = [(ex, c) for ex, c in r.args if not ex.has(type(node)) and ex is not sp.nan]
+            c0 = r.args[0][1]
+            generic = isinstance(c0, sp.Ne) or (isinstance(c0, sp.And) and all(isinstance(t, sp.Ne) for t in c0.args))
+            if len(good) == len(r.args) and generic:
+                # generic case first (n <> -1 for x^n): keep it with its condition, as Maple's answer does
+                rest = ['{} if {}'.format(self.mText(e), self.mText(c)) if c is not sp.true else
+                        '{} otherwise'.format(self.mText(e)) for e, c in r.args[1:]]
+                return r.args[0][0], [c0], ['{} = {} where {}; other case: {}'.format(
+                    txt, self.mText(r.args[0][0]), self.mText(c0), ', '.join(rest))], [], 'ok'
+            if len(good) == len(r.args):
+                return r, [], [], [], 'ok'
+            if not good:
+                return node, [], [], ['could not decide where {} converges'.format(txt)], 'undecided'
+            if len(good) == 1:
+                ex, c = good[0]
+                return ex, [c], ['{} = {} only where {} ({} condition)'.format(txt, self.mText(ex), self.mText(c),
+                                 'convergence' if kind != 'integral' else 'existence')], [], 'cond:{}'.format(len(good))
+            cond = sp.Or(*[c for _, c in good])
+            return sp.Piecewise(*(good + [(sp.nan, True)])), [cond], [], [], 'cond:{}'.format(len(good))
+        if r == node or r.has(type(node)):
+            if kind == 'integral':
+                return node, [], [], ['{} has no closed form here; only numeric checks were possible'.format(txt)], 'ok'
+            conv = self.convergence(node)
+            if conv is False or conv == sp.false:
+                return sp.nan, [], ['the {} {} diverges'.format(kind, txt)], [], 'divergent'
+            if conv is True or conv == sp.true:
+                return node, [], ['{} converges; no closed form, compared numerically'.format(txt)], [], 'ok'
+            return node, [], [], ['could not decide whether {} converges'.format(txt)], 'undecided'
+        return r, [], [], [], 'ok'
+
+    def boundaryReport(self, node, cond, field):
+        """Convergence at the boundary and outside the SymPy condition, tested at a few points."""
+        fs = [s for s in cond.free_symbols if isSym(s)]
+        if field != 'real' or len(fs) != 1:
+            return [], ['convergence outside {} was not analysed'.format(self.mText(cond))]
+        s = fs[0]
+        pts = set()
+        for rel in cond.atoms(sp.core.relational.Relational):
+            try:
+                z = sp.solveset(sp.Eq(rel.lhs, rel.rhs), s, sp.S.Reals)
+            except (NotImplementedError, ValueError, TypeError):
+                continue
+            if isinstance(z, sp.FiniteSet):
+                pts.update(p for p in z if p.is_real)
+        bnd = sorted(pts, key=lambda p: float(p))
+        tests = list(bnd)
+        if bnd:
+            tests += [bnd[0] - 1, bnd[-1] + 1]
+        div, conv, unk = [], [], []
+        for p in tests:
+            try:
+                inside = bool(cond.xreplace({s: p}))
+            except TypeError:
+                continue
+            v = self.convergence(node.xreplace({s: p}))
+            label = '{} = {}'.format(s.name, self.mText(p)) + (' (boundary)' if p in pts else '')
+            if inside:
+                if p in pts and (v is True or v == sp.true):
+                    conv.append(label)
+                continue
+            if v is False or v == sp.false:
+                div.append(label)
+            elif v is True or v == sp.true:
+                conv.append(label + ' outside the condition')
+            else:
+                unk.append(label)
+        notes, limits = [], []
+        if div:
+            notes.append('{} diverges at {}'.format(self.mText(node), ', '.join(div)))
+        if conv:
+            notes.append('{} converges at {}'.format(self.mText(node), ', '.join(conv)))
+        if unk:
+            limits.append('convergence of {} undecided at {}'.format(self.mText(node), ', '.join(unk)))
+        limits.append('divergence outside {} was checked only at the listed points, not proved'.format(self.mText(cond)))
+        return notes, limits
+
+    def resolveInert(self, e, field):
+        """Replace inert sums/products/integrals by closed forms, keeping their conditions."""
+        info = {'conds': [], 'notes': [], 'limits': [], 'status': 'ok'}
+        if not isinstance(e, sp.Basic):
+            return e, info
+        done = set()
+        for _ in range(8):
+            nodes = [n for n in e.atoms(*INERT_KINDS) if not n.function.has(*INERT_KINDS) and n not in done]
+            if not nodes:
+                break
+            rep = {}
+            for n in nodes:
+                v, cs, notes, limits, st = self.resolveOne(n)
+                rep[n] = v
+                done.add(v)
+                info['conds'] += cs
+                info['notes'] += notes
+                info['limits'] += limits
+                if st == 'divergent':
+                    info['status'] = 'divergent'
+                    if v in (sp.oo, -sp.oo) and n == e:
+                        info['infinite'] = v
+                elif st == 'undecided' and info['status'] == 'ok':
+                    info['status'] = 'undecided'
+                for c in (cs if st.startswith('cond') and not isinstance(n, sp.Integral) else []):
+                    if not self.pruneConds([c]):
+                        continue
+                    bn, bl = self.boundaryReport(n, c, field)
+                    info['notes'] += bn
+                    info['limits'] += bl
+            e = e.xreplace(rep)
+        return e, info
+
+    # ---- sets ----
+
+    def fieldSet(self, s, field):
+        base = FIELD_SETS[field]
+        if field == 'real' and s.is_integer:
+            base = sp.S.Integers
+        iv = self.boundsInterval(s) if field == 'real' else None
+        return base if iv is None else sp.Intersection(base, iv)
+
+    def condSet(self, c, s, field):
+        """Set of values of s where condition c holds (None when SymPy cannot say)."""
+        base = FIELD_SETS[field]
+        if c is sp.true:
+            return base
+        if c is sp.false:
+            return sp.S.EmptySet
+        if isinstance(c, sp.Ne):
+            z = sp.solveset(sp.Eq(c.lhs, c.rhs), s, base)
+            if isinstance(z, sp.ConditionSet):
+                return None
+            return sp.Complement(base, z)
+        if isinstance(c, sp.And):
+            parts = [self.condSet(t, s, field) for t in c.args]
+            return None if any(p is None for p in parts) else sp.Intersection(*parts)
+        if isinstance(c, sp.Or):
+            parts = [self.condSet(t, s, field) for t in c.args]
+            return None if any(p is None for p in parts) else sp.Union(*parts)
+        if field != 'real':
+            return None
+        r = sp.solveset(c, s, sp.S.Reals)
+        return None if isinstance(r, sp.ConditionSet) or r.has(sp.ConditionSet) else r
+
+    def mergeFamilies(self, sets, n):
+        """Join ImageSets p*n + c_i whose offsets are equally spaced (2*Pi*n, 2*Pi*n+Pi -> Pi*n)."""
+        groups = {}
+        rest = []
+        for S in sets:
+            lam = S.lamda
+            if S.base_sets != (sp.S.Integers,) or len(lam.variables) != 1:
+                rest.append(S)
+                continue
+            body = sp.expand(lam.expr.xreplace({lam.variables[0]: n}))
+            p = body.coeff(n)
+            c = sp.expand(body - p * n)
+            if p == 0 or c.has(n):
+                rest.append(S)
+                continue
+            groups.setdefault(p, []).append(c)
+        out = []
+        for p, cs in groups.items():
+            cs = sorted(set(cs), key=lambda c: float(sp.N(c)) if c.is_number else 0)
+            k = len(cs)
+            step = p / k
+            if k > 1 and all(sp.simplify(cs[i + 1] - cs[i] - step) == 0 for i in range(k - 1)):
+                out.append(step * n + cs[0])
+            else:
+                out.extend(p * n + c for c in cs)
+        return out, rest
+
+    def setText(self, S, s):
+        """Readable Maple-style description of a solution or exclusion set; returns (text, kind)."""
+        if S is sp.S.EmptySet:
+            return 'none', 'empty'
+        if isinstance(S, sp.FiniteSet):
+            return ', '.join('{} = {}'.format(s.name, self.mText(p)) for p in S), 'finite'
+        if S in (sp.S.Reals, sp.S.Complexes):
+            return 'every {} {}'.format('real' if S == sp.S.Reals else 'complex', s.name), 'all'
+        if isinstance(S, sp.Union) and all(isinstance(a, sp.Complement) for a in S.args) \
+                and len(set(a.args[1] for a in S.args)) == 1:
+            S = sp.Complement(sp.Union(*[a.args[0] for a in S.args], evaluate=False), S.args[0].args[1], evaluate=False)
+        if isinstance(S, sp.Complement) and isinstance(S.args[1], sp.FiniteSet):
+            a, ka = self.setText(S.args[0], s)
+            b, _ = self.setText(S.args[1], s)
+            return '{} except {}'.format(a, b), ka
+        if isinstance(S, sp.ConditionSet):
+            return 'not solved (solveset returned a ConditionSet)', 'unsolved'
+        parts = list(S.args) if isinstance(S, sp.Union) else [S]
+        fin, fams, other = [], [], []
+        imgs = []
+        for P in parts:
+            if isinstance(P, sp.FiniteSet):
+                fin.extend(P)
+            elif isinstance(P, sp.ImageSet):
+                imgs.append(P)
+            else:
+                other.append(P)
+        if imgs:
+            n = sp.Symbol(FAMILY_INDEX, integer=True)
+            merged, rest = self.mergeFamilies(imgs, n)
+            fams = ['{} = {}'.format(s.name, self.mText(m)) for m in merged]
+            other += rest
+        texts = ['{} = {}'.format(s.name, self.mText(p)) for p in fin] + fams
+        for P in other:
+            try:
+                texts.append(self.mText(P.as_relational(s)))
+            except (NotImplementedError, TypeError, AttributeError, ValueError):
+                texts.append(sp.sstr(P))
+        txt = (' or ' if other else ', ').join(texts)
+        if fams:
+            txt += ' ({} integer)'.format(FAMILY_INDEX)
+            return txt, 'family'
+        return txt, ('finite' if not other else 'set')
+
+    def condTexts(self, c, field):
+        """Maple text(s) of one condition; a nonzero condition with finitely many zeros becomes x <> a."""
+        fs = [s for s in c.free_symbols if isSym(s)]
+        if isinstance(c, sp.Ne) and len(fs) == 1:
+            s = fs[0]
+            try:
+                z = sp.solveset(sp.Eq(c.lhs, c.rhs), s, FIELD_SETS[field])
+            except (NotImplementedError, ValueError, TypeError):
+                z = None
+            if isinstance(z, sp.FiniteSet) and len(z) <= 6:
+                return ['{} <> {}'.format(s.name, self.mText(p)) for p in z], None
+            if z is not None and hasFamily(z):
+                txt, _ = self.setText(z, s)
+                return [self.mText(c)], 'excludes {}'.format(txt)
+        if isinstance(c, sp.core.relational.Relational) and not isinstance(c, (sp.Ne, sp.Eq)) and len(fs) == 1 \
+                and field == 'real':
+            s = fs[0]
+            d = c.lhs - c.rhs
+            if d.is_polynomial(s) and sp.degree(d, s) == 1 and not (c.lhs == s and c.rhs.is_number):
+                try:
+                    r = sp.solveset(c, s, sp.S.Reals)
+                    if isinstance(r, sp.Interval):
+                        return [self.mText(r.as_relational(s))], None
+                except (NotImplementedError, ValueError, TypeError):
+                    pass
+        return [self.mText(c)], None
+
+
+# ----------------------------------------------------------------------------
+# verify with domains (MCP check tools)
+# ----------------------------------------------------------------------------
+
+SUGGEST_MENU = [('nonnegative', '{} >= 0'), ('positive', '{} > 0'), ('negative', '{} < 0'), ('integer', '{}::integer')]
+
+
+class RigorMixin(object):
+    """verify over a field with domain conditions, convergence, and assumption suggestions."""
+
+    def assumeTexts(self, opts):
+        out = []
+        for node in (opts or {}).get('assume') or []:
+            if isinstance(node, dict) and node.get('fn') == 'type' and len(node.get('args', [])) == 2:
+                out.append('{}::{}'.format(exprText(node['args'][0]), exprText(node['args'][1])))
+            else:
+                out.append(exprText(node))
+        return out
+
+    def truthAt(self, c, pt):
+        """Truth of a condition at a numeric point: True, False or None."""
+        try:
+            v = c.xreplace(pt)
+        except (TypeError, ValueError):
+            return None
+        if v is sp.true or v is True:
+            return True
+        if v is sp.false or v is False:
+            return False
+        if isinstance(v, sp.And):
+            vals = [self.truthAt(t, {}) for t in v.args]
+            return False if False in vals else (True if all(x is True for x in vals) else None)
+        if isinstance(v, sp.Or):
+            vals = [self.truthAt(t, {}) for t in v.args]
+            return True if True in vals else (False if all(x is False for x in vals) else None)
+        if isinstance(v, sp.core.relational.Relational):
+            try:
+                a = sp.N(v.lhs - v.rhs, 30)
+                re_, im_ = a.as_real_imag()
+                if not (re_.is_number and im_.is_number):
+                    return None
+                if isinstance(v, sp.Ne):
+                    return abs(complex(a)) > 1e-25
+                if isinstance(v, sp.Eq):
+                    return abs(complex(a)) <= 1e-25
+                if abs(float(im_)) > 1e-25:
+                    return False
+                f = float(re_)
+                if isinstance(v, sp.StrictLessThan):
+                    return f < -1e-25
+                if isinstance(v, sp.LessThan):
+                    return f <= 1e-25
+                if isinstance(v, sp.StrictGreaterThan):
+                    return f > 1e-25
+                if isinstance(v, sp.GreaterThan):
+                    return f >= -1e-25
+            except (TypeError, ValueError, ZeroDivisionError, AttributeError):
+                return None
+        return None
+
+    def isReal(self, v):
+        return abs(v.imag) <= 1e-30 * max(1, abs(v))
+
+    def inDomain(self, v, conds, pt, field):
+        if v is None:
+            return False
+        if field == 'real' and not self.isReal(v):
+            return False
+        return all(self.truthAt(c, pt) is True for c in conds)
+
+    def smallPoints(self, syms, n):
+        """Extra sample points in (-1, 1) for domains such as abs(x) < 1."""
+        rng = random.Random(4242)
+        pts = []
+        for _ in range(n):
+            pt = {}
+            for s in syms:
+                if s.is_integer:
+                    pt[s] = self.drawReal(rng, s, -3, 3, True)
+                    continue
+                k = rng.randint(1, 9)
+                if s.is_negative or (not (s.is_positive or s.is_nonnegative) and rng.random() < 0.5):
+                    k = -k
+                pt[s] = sp.Rational(k, 10)
+            pts.append(pt)
+        return pts
+
+    def numericDomainCore(self, L, R, condsL, condsR, field):
+        exprs, nd = [], None
+        for e in (L, R):
+            e, n = self.floatize(e)
+            if n is not None:
+                nd = n if nd is None else min(nd, n)
+            exprs.append(e)
+        if any(e.has(*INERT_KINDS, sp.Limit) and e.has(sp.core.function.AppliedUndef) for e in exprs):
+            return {'verdict': 'undetermined'}
+        atoms = []
+        for e in exprs:
+            for at in self.undefAtoms(e):
+                if at not in atoms:
+                    atoms.append(at)
+        rep, back = {}, {}
+        for at in sorted(atoms, key=lambda x: -x.count_ops() if hasattr(x, 'count_ops') else 0):
+            dm = sp.Dummy('u', real=True) if field == 'real' else sp.Dummy('u')
+            rep[at] = dm
+            back[dm] = at
+        if rep:
+            exprs = [self.replaceAtoms(e, rep) for e in exprs]
+            condsL = [self.replaceAtoms(c, rep) for c in condsL]
+            condsR = [self.replaceAtoms(c, rep) for c in condsR]
+        syms = sorted(set().union(*[e.free_symbols for e in exprs + condsL + condsR]), key=lambda s: str(s))
+        pts = self.samplePoints(syms, 36)
+        real, cplx = pts[:24], pts[24:]
+        pts = []
+        while real or cplx:
+            pts += real[:2] + cplx[:1]
+            real, cplx = real[2:], cplx[1:]
+        pts += self.smallPoints(syms, 20)
+        if nd is not None:
+            nd = min(nd, self.digits)
+            tolEq, tolNe = 10.0 ** (-(nd - 1)), 10.0 ** (-(nd - 4))
+        else:
+            tolEq, tolNe = 1e-25, 1e-20
+
+        def key(s):
+            return s.name if isSym(s) and not isinstance(s, sp.Dummy) else self.atomKey(back.get(s, s))
+
+        def where(pt):
+            return {key(s): fmtPoint(v) for s, v in pt.items()}
+        good, borderline, witness, gap = 0, False, None, None
+        seen = set()
+        for pt in pts:
+            if good >= 12:
+                break
+            tag = tuple(sorted((str(k), str(v)) for k, v in pt.items()))
+            if tag in seen:
+                continue
+            seen.add(tag)
+            lv, rv = self.evalAt(exprs[0], pt), self.evalAt(exprs[1], pt)
+            inL = self.inDomain(lv, condsL, pt, field)
+            inR = self.inDomain(rv, condsR, pt, field)
+            if inL and inR:
+                good += 1
+                diff = abs(lv - rv)
+                scale = max(1, abs(lv), abs(rv))
+                if diff > tolNe * scale:
+                    return {'verdict': 'not_equal', 'counterexample': where(pt),
+                            'lhs_value': fmtValue(lv), 'rhs_value': fmtValue(rv)}
+                if diff > tolEq * scale:
+                    borderline = True
+                continue
+            if inL == inR:
+                continue
+            one, other = (lv, rv) if inL else (rv, lv)
+            if other is not None and abs(one - other) > tolNe * max(1, abs(one), abs(other)):
+                if witness is None and field == 'real':
+                    witness = {'point': where(pt), 'lhs_value': fmtValue(lv), 'rhs_value': fmtValue(rv),
+                               'real_side': 'lhs' if inL else 'rhs'}
+            elif other is None and gap is None:
+                gap = where(pt)
+        need = 3 if syms else 1
+        out = {'verdict': 'undetermined' if good < need or borderline else 'equal', 'good': good}
+        if witness:
+            out['witness'] = witness
+        if gap:
+            out['gap'] = gap
+        if nd is not None and out['verdict'] == 'equal':
+            out['note'] = 'compared to {} significant digits'.format(nd)
+        return out
+
+    def symbolicZero(self, d, quick=3, deep=5):
+        ok, z = timeLimited(quick, self.quickZero, d)
+        if ok and z:
+            return True, sp.Integer(0)
+        okD, zd = timeLimited(deep, self.deepZero, d)
+        if okD and zd and zd[0]:
+            return True, sp.Integer(0)
+        return False, (zd[1] if okD and zd and zd[1] is not None else d)
+
+    def prepareSide(self, e, field, raw=()):
+        """Resolve inert calculus and collect existence conditions of one side."""
+        e1, info = self.resolveInert(e, field)
+        conds, limits = self.condsOf(e1, field)
+        allc = []
+        for c in list(raw) + info['conds'] + conds:
+            for t in self.normCond(c, field):
+                if not any(t == o for o in allc):
+                    allc.append(t)
+        allc = self.pruneConds(allc)
+        info['limits'] += limits
+        info['condList'] = allc
+        return e1, info
+
+    def dropImplied(self, conds, s, field):
+        """Remove conditions implied by the others (one-variable case: x <> 0 next to x > 0)."""
+        keep = list(conds)
+        for c in reversed(list(conds)):
+            others = [o for o in keep if o is not c]
+            if not others or c not in keep:
+                continue
+            try:
+                sc = self.condSet(c, s, field)
+                so = [self.condSet(o, s, field) for o in others]
+                if sc is None or any(x is None for x in so):
+                    continue
+                if sp.Intersection(self.fieldSet(s, field), *so).is_subset(sc) is True:
+                    keep.remove(c)
+            except (NotImplementedError, TypeError, ValueError, AttributeError):
+                continue
+        return keep
+
+    def domainInfo(self, condsL, condsR, common, field, syms, gap, witness):
+        """Text of the domains, the conditions and whether both sides share the same natural domain."""
+        texts, extra = [], []
+        if len(syms) == 1:
+            common = self.dropImplied(common, syms[0], field)
+            condsL = self.dropImplied(condsL, syms[0], field)
+            condsR = self.dropImplied(condsR, syms[0], field)
+        for c in common:
+            ts, ex = self.condTexts(c, field)
+            for t in ts:
+                if t not in texts:
+                    texts.append(t)
+            if ex:
+                extra.append('{}: {}'.format(self.mText(c), ex))
+        whole = 'all real numbers' if field == 'real' else 'all complex numbers'
+        if self.assume.props or self.assume.bounds:
+            whole = 'every value allowed by the assumptions'
+
+        def side(cs):
+            out = []
+            for c in cs:
+                out += self.condTexts(c, field)[0]
+            return ' and '.join(out) if out else whole
+        dom = {'lhs': side(condsL), 'rhs': side(condsR), 'common': ' and '.join(texts) if texts else whole}
+        same = None
+        sl = set(self.mText(c) for c in condsL)
+        sr = set(self.mText(c) for c in condsR)
+        if sl == sr:
+            same = True
+        elif len(syms) == 1:
+            s = syms[0]
+            base = self.fieldSet(s, field)
+            try:
+                dl = [self.condSet(c, s, field) for c in condsL]
+                dr = [self.condSet(c, s, field) for c in condsR]
+                if not any(x is None for x in dl + dr):
+                    DL = sp.Intersection(base, *dl) if dl else base
+                    DR = sp.Intersection(base, *dr) if dr else base
+                    diff = undoComplement(sp.Union(sp.Complement(DL, DR), sp.Complement(DR, DL)))
+                    if diff is sp.S.EmptySet:
+                        same = True
+                    else:
+                        same = False
+                        txt, _ = self.setText(diff, s)
+                        if not isinstance(diff, (sp.Complement, sp.Intersection)):
+                            dom['differ_at'] = txt
+            except (NotImplementedError, TypeError, ValueError, AttributeError, RecursionError):
+                same = None
+        if same is None and (gap or witness):
+            same = False
+        dom['same_domain'] = same
+        return texts, extra, dom
+
+    def verifyRich(self, L, R, field, suggest=True, rawL=None, rawR=None):
+        """verify lhs = rhs over a field: equality on the common domain, with its conditions."""
+        start = time.time()
+        okR, raws = timeLimited(5, lambda: (self.rawConds(rawL, field), self.rawConds(rawR, field)))
+        cL, cR = raws if okR else ([], [])
+        rep = self.fieldRep([L, R] + cL + cR, field)
+        L0, R0 = L.xreplace(rep), R.xreplace(rep)
+        cL, cR = [c.xreplace(rep) for c in cL], [c.xreplace(rep) for c in cR]
+        out = {'field': field, 'notes': [], 'limitations': []}
+        ok, sides = timeLimited(20, lambda: (self.prepareSide(L0, field, cL), self.prepareSide(R0, field, cR)))
+        if not ok:
+            out.update({'verdict': 'undetermined', 'method': 'timeout', 'conditions': []})
+            out['limitations'].append('the domain analysis timed out')
+            return out
+        (L1, iL), (R1, iR) = sides
+        for i in (iL, iR):
+            out['notes'] += i['notes']
+            out['limitations'] += i['limits']
+        condsL, condsR = iL['condList'], iR['condList']
+        if sp.false in condsL or sp.false in condsR:
+            bad = 'lhs' if sp.false in condsL else 'rhs'
+            out.update({'verdict': 'undetermined', 'method': 'domain', 'conditions': []})
+            out['notes'].append('{} is not defined anywhere over the {}s'.format(bad, field))
+            return out
+        common = list(condsL) + [c for c in condsR if not any(c == o for o in condsL)]
+        infL, infR = iL.get('infinite', L1), iR.get('infinite', R1)
+        if 'divergent' in (iL['status'], iR['status']) and infL in (sp.oo, -sp.oo) and infL == infR:
+            out.update({'verdict': 'equal', 'method': 'symbolic', 'conditions': []})
+            out['notes'].append('both sides are {} (divergent)'.format(self.mText(infL)))
+            return out
+        if 'divergent' in (iL['status'], iR['status']):
+            both = iL['status'] == iR['status']
+            out.update({'verdict': 'undetermined' if both else 'not_equal', 'method': 'convergence',
+                        'conditions': [self.mText(c) for c in common]})
+            out['notes'].append('both sides diverge' if both else '{} diverges, so it has no value; the other side does'
+                                .format('lhs' if iL['status'] == 'divergent' else 'rhs'))
+            return out
+        srep = self.strengthenRep(common, field)
+        Ls, Rs = L1.xreplace(srep), R1.xreplace(srep)
+        symEq, diff = self.symbolicZero(Ls - Rs)
+        undecided = 'undecided' in (iL['status'], iR['status'])
+        # a series of undecided convergence is not sampled: its numeric value could be meaningless
+        num = self.numericTest2(L1, R1, condsL, condsR, field) if not undecided else {'verdict': 'undetermined'}
+        syms = sorted({s for t in [L1, R1] + common for s in t.free_symbols if isSym(s)}, key=lambda s: s.name)
+        method = 'symbolic' if symEq else 'numeric'
+        if num['verdict'] == 'not_equal':
+            if symEq:
+                out.update({'verdict': 'undetermined', 'method': 'symbolic'})
+                out['notes'].append('symbolic simplification gives 0 but a sampled point disagrees')
+            else:
+                out.update({'verdict': 'not_equal', 'method': 'numeric', 'counterexample': num['counterexample'],
+                            'lhs_value': num['lhs_value'], 'rhs_value': num['rhs_value']})
+                out['notes'].append('the counterexample lies inside the common domain')
+        elif symEq or num['verdict'] == 'equal':
+            if num.get('witness'):
+                w = num['witness']
+                other = 'rhs' if w['real_side'] == 'lhs' else 'lhs'
+                out.update({'verdict': 'not_equal', 'method': 'numeric', 'outside_domain': w})
+                diff = L1 - R1
+                out['notes'].append('the sides agree on the common real domain, but at {} the {} is real and in its '
+                                    'domain while the {} is not real (outside its real domain) and has a different '
+                                    'value'.format(', '.join('{} = {}'.format(k, v) for k, v in w['point'].items()),
+                                                   w['real_side'], other))
+            else:
+                out.update({'verdict': 'equal', 'method': method})
+                if method == 'numeric' and num.get('note'):
+                    out['notes'].append(num['note'])
+        else:
+            out.update({'verdict': 'undetermined', 'method': 'numeric'})
+        if undecided and out['verdict'] == 'undetermined':
+            out['method'] = 'convergence'
+        if undecided and out['verdict'] == 'equal':
+            out['verdict'] = 'undetermined'
+            out['notes'].append('equal where the series converges, but convergence could not be decided')
+        if diff is not None:
+            out['difference'] = diff
+        okD, dres = timeLimited(10, self.domainInfo, condsL, condsR, common, field, syms, num.get('gap'),
+                                num.get('witness'))
+        if okD:
+            texts, extra, dom = dres
+            out['conditions'] = texts
+            out['domain'] = dom
+            out['notes'] += extra
+            w = out.get('outside_domain')
+            if w:
+                other = 'rhs' if w['real_side'] == 'lhs' else 'lhs'
+                out['notes'].append('over the reals the {} requires {}, the {} only {}'.format(
+                    other, dom[other], w['real_side'], dom[w['real_side']]))
+            if dom['same_domain'] is False and out['verdict'] == 'equal':
+                out['notes'].append('equal where both sides are defined; the domains differ{}'.format(
+                    ' where ' + dom['differ_at'] if dom.get('differ_at') else ''))
+            if dom['same_domain'] is None and len(syms) > 0 and common:
+                out['limitations'].append('could not decide whether both sides have the same domain')
+        else:
+            out['conditions'] = [self.mText(c) for c in common]
+            out['limitations'].append('the domain description timed out; conditions are listed unsolved')
+        if out['verdict'] == 'equal' and method == 'numeric':
+            out['limitations'].append('equality on the domain was checked numerically at sample points, not proved')
+        if suggest and out['verdict'] != 'equal' and time.time() - start < 30:
+            sug = self.suggest(L, R, field, syms)
+            if sug:
+                out['suggestion'] = sug
+        return out
+
+    def numericTest2(self, L, R, condsL, condsR, field, budget=25):
+        ok, res = timeLimited(budget, self.numericDomainCore, L, R, condsL, condsR, field)
+        if not ok or res is None:
+            return {'verdict': 'undetermined'}
+        return res
+
+    def proveUnder(self, L, R, field, rep):
+        """Symbolic-only proof of L = R on the common domain after replacing symbols (for suggestions)."""
+        L1, R1 = L.xreplace(rep), R.xreplace(rep)
+        frep = self.fieldRep([L1, R1], field)
+        L1, R1 = L1.xreplace(frep), R1.xreplace(frep)
+        ok, sides = timeLimited(4, lambda: (self.prepareSide(L1, field), self.prepareSide(R1, field)))
+        if not ok:
+            return None
+        (A, iA), (B, iB) = sides
+        if 'divergent' in (iA['status'], iB['status']) or 'undecided' in (iA['status'], iB['status']):
+            return None
+        common = iA['condList'] + [c for c in iB['condList'] if not any(c == o for o in iA['condList'])]
+        if sp.false in common:
+            return None
+        srep = self.strengthenRep(common, field)
+        z, _ = self.symbolicZero(A.xreplace(srep) - B.xreplace(srep), 1, 3)
+        if not z:
+            return None
+        if field == 'real':
+            num = self.numericTest2(A, B, iA['condList'], iB['condList'], field, 4)
+            if num.get('witness') or num['verdict'] == 'not_equal':
+                return None
+        return [self.mText(c) for c in common]
+
+    def suggest(self, L, R, field, syms):
+        """Try a small menu of assumptions; keep the weakest that gives a symbolic proof."""
+        free = [s for s in syms if not isinstance(s, (sp.Dummy, IdxSym))]
+        if not free or len(free) > 2:
+            return None
+        start = time.time()
+        byName = {}
+        for e in (L, R):
+            for s in e.free_symbols:
+                if isSym(s):
+                    byName[s.name] = s
+        trials = []
+        for prop, txt in SUGGEST_MENU:
+            for s in free:
+                if s.name in byName:
+                    trials.append(([(byName[s.name], prop)], txt.format(s.name)))
+            if len(free) == 2 and all(s.name in byName for s in free):
+                trials.append(([(byName[s.name], prop) for s in free], ' and '.join(txt.format(s.name) for s in free)))
+        proved = []
+        for pairs, txt in trials:
+            if time.time() - start > 12:
+                break
+            rep = {}
+            for s, prop in pairs:
+                if getattr(s, 'is_' + prop):
+                    rep = None
+                    break
+                ns = self.newSym(s, {prop: True}, field)
+                if ns is None:
+                    rep = None
+                    break
+                rep[s] = ns
+            if not rep:
+                continue
+            conds = self.proveUnder(L, R, field, rep)
+            if conds is not None:
+                proved.append((txt, conds))
+        if not proved:
+            return None
+        # the assumption that leaves the fewest extra conditions wins; menu order breaks ties
+        txt, conds = min(proved, key=lambda p: len(p[1]))
+        line = 'equal if {}'.format(txt)
+        if conds:
+            line += ' (where {})'.format(' and '.join(conds))
+        return line + ' -- found by trying a fixed menu of assumptions; the equality under it is a symbolic proof'
+
+    def richOut(self, res, opts):
+        """Engine JSON of a rich result: Maple strings, EXPR difference, legacy note field."""
+        out = {}
+        for k, v in res.items():
+            if k in ('difference',):
+                if isinstance(v, sp.Basic):
+                    out[k] = self.cv.toExpr(v)
+            elif k != 'notes':
+                out[k] = v
+        out.setdefault('verdict', 'undetermined')
+        out.setdefault('method', 'numeric')
+        out.setdefault('conditions', [])
+        out.setdefault('limitations', [])
+        out['assumptions_used'] = self.assumeTexts(opts)
+        notes = [n for n in res.get('notes', []) if n]
+        if notes:
+            out['notes'] = notes
+            out['note'] = '; '.join(notes)
+        return out
+
+    def richVerify(self, L, R, field, opts, raws=(None, None)):
+        if isinstance(L, Seq) and len(L) == 1:
+            L = L[0]
+        if isinstance(R, Seq) and len(R) == 1:
+            R = R[0]
+        scalar = all(isinstance(t, sp.Basic) and not isRel(t) and t not in (sp.true, sp.false) for t in (L, R))
+        if scalar:
+            return self.richOut(self.verifyRich(L, R, field, rawL=raws[0], rawR=raws[1]), opts)
+        res = self.verifyAny(L, R)
+        res['field'] = field
+        res['limitations'] = ['domain conditions are analysed only for scalar expressions; lists, sets, '
+                              'equations and matrices are compared elementwise without them']
+        if res.get('note'):
+            res['notes'] = [res.pop('note')]
+        return self.richOut(res, opts)
+
+
+# ----------------------------------------------------------------------------
+# check_step and check_solution
+# ----------------------------------------------------------------------------
+
+def eqSides(x):
+    """Equation -> (lhs, rhs); an expression e means e = 0; None for other relations."""
+    if isRel(x):
+        op, l, r = relParts(x)
+        return (l, r) if op == 'eq' else None
+    return (x, sp.Integer(0))
+
+
+def nonEmpty(X):
+    """True/False when it is clear whether a set is empty, else None."""
+    if X is sp.S.EmptySet:
+        return False
+    if isinstance(X, (sp.FiniteSet, sp.Interval, sp.ImageSet)) or X in (sp.S.Reals, sp.S.Complexes, sp.S.Integers):
+        return True
+    if isinstance(X, sp.Union):
+        vals = [nonEmpty(a) for a in X.args]
+        return True if True in vals else (False if all(v is False for v in vals) else None)
+    if isinstance(X, sp.Complement) and isinstance(X.args[1], sp.FiniteSet):
+        a = X.args[0]
+        if a.is_finite_set is False or hasFamily(a) or isinstance(a, sp.Interval):
+            return True
+    return None
+
+
+class StepMixin(object):
+    """check_step: equivalent / implies / implied_by / not_equivalent; check_solution with domains."""
+
+    def fieldOpt(self, opts):
+        f = (opts or {}).get('field')
+        return f if f in FIELD_SETS else 'real'
+
+    def opCheckStep(self, req):
+        opts = req.get('opts') or {}
+        self.setup(opts)
+        field = self.fieldOpt(opts)
+        try:
+            B = self.cv.toSympy(req['before'])
+            A = self.cv.toSympy(req['after'])
+            V = self.cv.toSympy(req['var']) if req.get('var') else None
+        except (MapleError, KeyError, TypeError, ValueError, IndexError) as exc:
+            return {'ok': False, 'error': self.errMsg('check_step', str(exc))}
+        try:
+            raws = ([req['before'], req.get('before_raw')], [req['after'], req.get('after_raw')])
+            res = self.checkStep(B, A, V, field, raws)
+        except MapleError as exc:
+            return {'ok': False, 'error': self.errMsg('check_step', str(exc))}
+        except (EngineTimeout, RecursionError):
+            res = {'classification': 'undetermined', 'verdict': 'undetermined', 'method': 'timeout',
+                   'limitations': ['the step check timed out']}
+        except Exception as exc:
+            res = {'classification': 'undetermined', 'verdict': 'undetermined', 'method': 'error',
+                   'limitations': ['internal error: {}'.format(str(exc).split('\n')[0][:200])]}
+        res['field'] = field
+        return {'ok': True, 'result': self.richOut(res, opts)}
+
+    def eqDomain(self, sides, v, field, extra=()):
+        """Conditions of an equation (both sides) and the set of v where they hold."""
+        conds, limits = [c for c in extra], []
+        for t in sides:
+            e1, info = self.resolveInert(t, field)
+            cs, lim = self.condsOf(e1, field)
+            limits += lim + info['limits']
+            for c in info['conds'] + cs:
+                for u in self.normCond(c, field):
+                    if not any(u == o for o in conds):
+                        conds.append(u)
+        D = self.fieldSet(v, field)
+        for c in conds:
+            if v not in c.free_symbols:
+                continue
+            S = self.condSet(c, v, field)
+            if S is None:
+                limits.append('could not solve the domain condition {}'.format(self.mText(c)))
+                continue
+            D = sp.Intersection(D, S)
+        return conds, D, limits
+
+    def solveIn(self, l, r, v, field, extra=()):
+        conds, D, limits = self.eqDomain([l, r], v, field, extra)
+        S = sp.solveset(sp.Eq(l, r), v, self.fieldSet(v, field))
+        if not S.has(sp.ConditionSet):
+            S = sp.Intersection(S, D)
+        return S, conds, limits
+
+    def stepCause(self, lb, rb, la, ra, v, kind):
+        dB, dA = lb - rb, la - ra
+        if dA == 0 or dB == 0:
+            return None
+        try:
+            q = sp.cancel(sp.together((lb ** 2 - rb ** 2) / dA))
+            if kind in ('implies', 'not_equivalent') and q.is_number and q != 0:
+                return 'the new equation is the old one squared (lhs^2 = rhs^2); squaring adds the solutions of ' \
+                       'lhs = -rhs, so those must be rejected by checking them in the original equation'
+            q = sp.cancel(sp.together(dB / dA))
+            if q.is_number:
+                return None
+            if not q.is_rational_function(v):
+                return None
+            if kind == 'implied_by' and q.has(v):
+                return 'the step divides by {}, which vanishes at solutions of the original equation; those ' \
+                       'solutions are lost'.format(self.mText(q))
+            if kind == 'implies' and (1 / q).has(v):
+                return 'the step multiplies by {}, whose zeros become new (spurious) solutions'.format(self.mText(1 / q))
+        except (ZeroDivisionError, TypeError, ValueError, NotImplementedError, sp.PolynomialError):
+            return None
+        return None
+
+    def checkStep(self, B, A, V, field, raws=(None, None)):
+        if isinstance(B, Seq) and len(B) == 1:
+            B = B[0]
+        if isinstance(A, Seq) and len(A) == 1:
+            A = A[0]
+        if not isRel(B) and not isRel(A):
+            res = self.verifyRich(B, A, field, rawL=raws[0], rawR=raws[1])
+            res['step'] = 'rewrite'
+            res['classification'] = {'equal': 'equivalent', 'not_equal': 'not_equivalent'}.get(res['verdict'],
+                                                                                            'undetermined')
+            return res
+        sb, sa = eqSides(B), eqSides(A)
+        if sb is None or sa is None:
+            raise MapleError('only equations (or expressions meaning expr = 0) can be compared as a step')
+        rcB, rcA = self.rawConds(raws[0], field), self.rawConds(raws[1], field)
+        rep = self.fieldRep(list(sb) + list(sa) + rcB + rcA, field)
+        lb, rb = [t.xreplace(rep) for t in sb]
+        la, ra = [t.xreplace(rep) for t in sa]
+        rcB, rcA = [c.xreplace(rep) for c in rcB], [c.xreplace(rep) for c in rcA]
+        syms = sorted({s for t in [lb, rb, la, ra] + rcB + rcA for s in t.free_symbols if isSym(s)}, key=lambda s: s.name)
+        if V is not None:
+            if not isSym(V):
+                raise MapleError('var must be a name')
+            v = next((s for s in syms if s.name == V.name), V)
+        elif len(syms) == 1:
+            v = syms[0]
+        else:
+            raise MapleError('give var: the equations contain {}'.format(', '.join(s.name for s in syms) or 'no unknown'))
+        params = [s for s in syms if s != v]
+        res = {'step': 'equation', 'var': v.name, 'notes': [], 'limitations': [], 'method': 'solveset'}
+        ok, got = timeLimited(25, lambda: (self.solveIn(lb, rb, v, field, rcB), self.solveIn(la, ra, v, field, rcA)))
+        if not ok:
+            res.update({'classification': 'undetermined', 'verdict': 'undetermined'})
+            res['limitations'].append('solving the equations timed out')
+            return res
+        (Sb, cb, limB), (Sa, ca, limA) = got
+        res['limitations'] += limB + limA
+        conds = cb + [c for c in ca if not any(c == o for o in cb)]
+        res['conditions'] = [t for c in conds for t in self.condTexts(c, field)[0]]
+        whole = 'all real numbers' if field == 'real' else 'all complex numbers'
+        res['domain'] = {'before': ' and '.join(t for c in self.dropImplied(cb, v, field)
+                                                for t in self.condTexts(c, field)[0]) or whole,
+                         'after': ' and '.join(t for c in self.dropImplied(ca, v, field)
+                                               for t in self.condTexts(c, field)[0]) or whole}
+        okT, texts = timeLimited(8, lambda: (self.setText(Sb, v), self.setText(Sa, v)))
+        if okT:
+            (tb, kb), (ta, ka) = texts
+            res['solutions_before'], res['solutions_after'] = tb, ta
+            res['family'] = 'family' in (kb, ka)
+        for name, S in (('original', Sb), ('new', Sa)):
+            if S.has(sp.ConditionSet):
+                res.update({'classification': 'undetermined', 'verdict': 'undetermined'})
+                res['notes'].append('solveset could not solve the {} equation completely (it returned a '
+                                    'ConditionSet), so the solution sets cannot be compared'.format(name))
+                return res
+        okC, sets = timeLimited(10, lambda: (sp.Complement(Sa, Sb), sp.Complement(Sb, Sa)))
+        if not okC:
+            res.update({'classification': 'undetermined', 'verdict': 'undetermined'})
+            res['limitations'].append('comparing the solution sets timed out')
+            return res
+        extra, lost = sets
+        ne, nl = nonEmpty(extra), nonEmpty(lost)
+        if ne is None or nl is None:
+            res.update({'classification': 'undetermined', 'verdict': 'undetermined'})
+            res['notes'].append('could not decide whether the two solution sets are equal')
+            return res
+        kind = {(False, False): 'equivalent', (True, False): 'implies', (False, True): 'implied_by',
+                (True, True): 'not_equivalent'}[(ne, nl)]
+        if params:
+            okP, q = timeLimited(5, lambda: sp.cancel(sp.together((lb - rb) / (la - ra))))
+            if okP and q is not None and not q.is_number and not q.has(v):
+                zq = sp.solve(q, params) if q.free_symbols else []
+                zi = sp.solve(1 / q, params) if q.free_symbols else []
+                if zq and kind in ('equivalent', 'implies'):
+                    kind = 'implied_by' if kind == 'equivalent' else 'not_equivalent'
+                    res['notes'].append('the step divides by {}: where {} = 0 every {} solves the original equation, '
+                                        'but not the new one'.format(self.mText(q), self.mText(q), v.name))
+                if zi and kind in ('equivalent', 'implied_by'):
+                    kind = 'implies' if kind == 'equivalent' else 'not_equivalent'
+                    res['notes'].append('the step multiplies by {}, which can vanish'.format(self.mText(1 / q)))
+            res['limitations'].append('solution sets were computed for generic values of {} (solveset treats '
+                                      'parameters as generic)'.format(', '.join(s.name for s in params)))
+        res['classification'] = kind
+        res['verdict'] = 'equal' if kind == 'equivalent' else 'not_equal'
+        if ne:
+            res['spurious'] = self.setText(extra, v)[0]
+        if nl:
+            res['lost'] = self.setText(lost, v)[0]
+        okW, cause = timeLimited(5, self.stepCause, lb, rb, la, ra, v, kind)
+        if okW and cause:
+            res['notes'].append(cause)
+        return res
+
+    # ---- check_solution ----
+
+    def opCheckSolution(self, req):
+        opts = req.get('opts') or {}
+        self.setup(opts)
+        field = self.fieldOpt(opts)
+        try:
+            eqs = [self.cv.toSympy(e) for e in req['equations']]
+            cands = [[self.cv.toSympy(e) for e in c] for c in req['candidates']]
+        except (MapleError, KeyError, TypeError, ValueError, IndexError) as exc:
+            return {'ok': False, 'error': self.errMsg('check_solution', str(exc))}
+        try:
+            raws = req['equations']
+            er = req.get('equations_raw')
+            if isinstance(er, list) and len(er) == len(raws):
+                raws = [[a, b] for a, b in zip(raws, er)]
+            res = self.checkSolution(eqs, cands, field, raws)
+        except MapleError as exc:
+            return {'ok': False, 'error': self.errMsg('check_solution', str(exc))}
+        except (EngineTimeout, RecursionError):
+            res = {'verdict': 'undetermined', 'method': 'timeout', 'limitations': ['the check timed out']}
+        except Exception as exc:
+            res = {'verdict': 'undetermined', 'method': 'error',
+                   'limitations': ['internal error: {}'.format(str(exc).split('\n')[0][:200])]}
+        res['field'] = field
+        return {'ok': True, 'result': self.richOut(res, opts)}
+
+    def checkOne(self, l, r, pt, field, conds):
+        """One equation at one candidate point: (status, detail)."""
+        for c in conds:
+            try:
+                tv = self.truthAt(c.subs(pt), {})
+            except (TypeError, ValueError, ZeroDivisionError):
+                tv = None
+            if tv is False:
+                return 'outside_domain', 'the condition {} of the original equation fails'.format(self.mText(c))
+        try:
+            lv, rv = l.subs(pt), r.subs(pt)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 'undetermined', 'could not substitute'
+        if any(x.has(sp.nan, sp.zoo) for x in (lv, rv)):
+            return 'outside_domain', 'the equation is not defined there'
+        z, best = self.symbolicZero(lv - rv)
+        if z:
+            return 'satisfied', 'lhs - rhs simplifies to 0'
+        a, b = self.evalAt(lv, {}), self.evalAt(rv, {})
+        if a is None or b is None:
+            return 'undetermined', 'could not evaluate lhs - rhs = {}'.format(self.mText(best))
+        if field == 'real' and not (self.isReal(a) and self.isReal(b)):
+            return 'outside_domain', 'a side is not real there (lhs = {}, rhs = {})'.format(fmtValue(a), fmtValue(b))
+        if abs(a - b) > 1e-20 * max(1, abs(a), abs(b)):
+            return 'not_satisfied', 'lhs = {}, rhs = {}'.format(fmtValue(a), fmtValue(b))
+        return 'satisfied_numeric', 'lhs - rhs vanishes numerically (40 digits) but was not simplified to 0'
+
+    def checkSolution(self, eqs, cands, field, raws):
+        pairs = []
+        for e in eqs:
+            s = eqSides(e)
+            if s is None:
+                raise MapleError('equations must be equations or expressions (meaning expr = 0)')
+            pairs.append(s)
+        allE = [t for p in pairs for t in p] + [t for c in cands for t in c]
+        rep = self.fieldRep([t for t in allE if isinstance(t, sp.Basic)], field)
+        pairs = [(l.xreplace(rep), r.xreplace(rep)) for l, r in pairs]
+        byName = {s.name: s for s in rep.values()}
+        byName.update({s.name: s for p in pairs for t in p for s in t.free_symbols if isSym(s)})
+        res = {'notes': [], 'limitations': [], 'method': 'symbolic', 'candidates': []}
+        eqConds, texts = [], []
+        for (l, r), raw in zip(pairs, raws):
+            cs = [c.xreplace(rep) for c in self.rawConds(raw, field)]
+            for t in (l, r):
+                e1, info = self.resolveInert(t, field)
+                cs += info['conds'] + self.condsOf(e1, field)[0]
+            cs = [u for c in cs for u in self.normCond(c, field)]
+            eqConds.append(cs)
+            for c in cs:
+                for t in self.condTexts(c, field)[0]:
+                    if t not in texts:
+                        texts.append(t)
+        res['conditions'] = texts
+        variables = []
+        accepted = []
+        for cand in cands:
+            pt = {}
+            for c in cand:
+                if not isRel(c) or relParts(c)[0] != 'eq':
+                    raise MapleError('solution must be equations like x = 2')
+                _, k, val = relParts(c)
+                if isSym(k):
+                    k = byName.get(k.name, k)
+                    if k not in variables:
+                        variables.append(k)
+                pt[k] = val.xreplace(rep) if isinstance(val, sp.Basic) else val
+            status, details = 'accepted', []
+            for i, (l, r) in enumerate(pairs):
+                st, det = self.checkOne(l, r, pt, field, eqConds[i])
+                details.append('equation {}: {}: {}'.format(i + 1, st.replace('_', ' '), det))
+                if st in ('outside_domain', 'not_satisfied'):
+                    status = 'rejected'
+                elif st == 'undetermined' and status == 'accepted':
+                    status = 'undetermined'
+                elif st == 'satisfied_numeric' and status == 'accepted':
+                    res['method'] = 'numeric'
+            ptText = ', '.join('{} = {}'.format(self.mText(k), self.mText(v)) for k, v in pt.items())
+            res['candidates'].append({'point': ptText, 'status': status, 'details': details})
+            if status == 'accepted':
+                accepted.append(pt)
+        sts = [c['status'] for c in res['candidates']]
+        res['verdict'] = 'not_equal' if 'rejected' in sts else ('equal' if sts and all(s == 'accepted' for s in sts)
+                                                                else 'undetermined')
+        rejected = [c['point'] for c in res['candidates'] if c['status'] == 'rejected']
+        if rejected:
+            res['rejected'] = rejected
+        self.completeness(pairs, variables, accepted, field, res, eqConds)
+        return res
+
+    def completeness(self, pairs, variables, accepted, field, res, eqConds):
+        """Are the accepted candidates all the solutions? Says so only when solveset/solve can tell."""
+        numeric = all(isinstance(v, sp.Basic) and v.is_number for pt in accepted for v in pt.values())
+        if len(pairs) == 1 and len(variables) == 1 and numeric:
+            v = variables[0]
+            l, r = pairs[0]
+            if any(s != v for s in (l - r).free_symbols):
+                res['complete'] = None
+                res['completeness'] = 'not established: the equation has parameters besides {}'.format(v.name)
+                return
+            ok, got = timeLimited(15, self.solveIn, l, r, v, field, eqConds[0])
+            if not ok:
+                res['complete'] = None
+                res['completeness'] = 'not established: solving the equation timed out'
+                return
+            S, _, _ = got
+            txt, kind = self.setText(S, v) if not S.has(sp.ConditionSet) else (self.mText(S), 'unsolved')
+            if kind != 'unsolved':
+                res['all_solutions'] = txt
+            if kind == 'unsolved' or S.has(sp.ConditionSet):
+                res['complete'] = None
+                res['completeness'] = 'not established: solveset could not solve the equation (ConditionSet)'
+            elif kind in ('family', 'all', 'set'):
+                res['complete'] = False
+                res['family'] = kind == 'family'
+                res['completeness'] = 'the equation has infinitely many solutions over the {}s ({}); a finite ' \
+                                      'list of candidates cannot be complete'.format(field, txt)
+            elif kind == 'empty':
+                res['complete'] = not accepted
+                res['completeness'] = 'the equation has no solutions over the {}s'.format(field)
+            elif isinstance(S, sp.FiniteSet):
+                got = [pt[v] for pt in accepted if v in pt]
+                missing = [p for p in S if not any(sp.simplify(p - g) == 0 for g in got)]
+                res['complete'] = not missing
+                res['completeness'] = 'the accepted candidates are all the solutions over the {}s'.format(field) \
+                    if not missing else 'missing solutions: {}'.format(
+                        ', '.join('{} = {}'.format(v.name, self.mText(p)) for p in missing))
+            else:
+                res['complete'] = None
+                res['completeness'] = 'not established'
+            return
+        polys = len(variables) >= 1 and all((l - r).is_polynomial(*variables) for l, r in pairs) and numeric
+        if polys and all((l - r).free_symbols <= set(variables) for l, r in pairs):
+            ok, sols = timeLimited(10, lambda: sp.solve([l - r for l, r in pairs], variables, dict=True))
+            if ok and isinstance(sols, list) and all(set(s.keys()) == set(variables) for s in sols):
+                if field == 'real':
+                    sols = [s for s in sols if all(x.is_real for x in s.values())]
+                missing = [s for s in sols if not any(all(sp.simplify(s[k] - pt.get(k, sp.nan)) == 0
+                                                          for k in variables) for pt in accepted)]
+                res['complete'] = not missing
+                res['completeness'] = 'the accepted candidates are all the solutions of the polynomial system' \
+                    if not missing else 'missing solutions: {}'.format('; '.join(
+                        ', '.join('{} = {}'.format(k.name, self.mText(s[k])) for k in variables) for s in missing))
+                return
+        res['complete'] = None
+        res['completeness'] = 'not established: only the given candidates were checked'
 
 
 # ----------------------------------------------------------------------------
@@ -4790,7 +6364,7 @@ HANDLERS.update({
 # ==== HANDLER MIXINS GO ABOVE THIS LINE ====
 
 class Engine(ArithMixin, CalculusMixin, SolveMixin, PolyMixin, NumberMixin, MiscMixin, LinAlgMixin,
-             TransformMixin, VecCalcMixin, VerifyMixin, PrintMixin):
+             TransformMixin, VecCalcMixin, VerifyMixin, DomainMixin, RigorMixin, StepMixin, PrintMixin):
     """Request dispatcher: protocol, conversion context, registry, verify, printing."""
 
     def __init__(self):
@@ -4825,6 +6399,10 @@ class Engine(ArithMixin, CalculusMixin, SolveMixin, PolyMixin, NumberMixin, Misc
             return self.opCall(req)
         if op == 'verify':
             return self.opVerify(req)
+        if op == 'check_step':
+            return self.opCheckStep(req)
+        if op == 'check_solution':
+            return self.opCheckSolution(req)
         if op == 'latex':
             return self.opLatex(req)
         if op == 'pretty':

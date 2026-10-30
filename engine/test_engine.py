@@ -1721,5 +1721,367 @@ class TestRegistry(Base):
         self.assertLess(elapsed, 5.0)
 
 
+# ----------------------------------------------------------------------------
+# verify over a field: domains, convergence, suggestions (MCP check tools)
+# ----------------------------------------------------------------------------
+
+class RigorBase(Base):
+    def rv(self, lhs, rhs, field='real', assume=None, raw=True):
+        """Domain-aware verify; the request trees double as the raw trees, as the MCP server sends them."""
+        req = {'op': 'verify', 'lhs': X(lhs), 'rhs': X(rhs),
+               'opts': {'digits': 10, 'assume': [X(a) for a in (assume or [])], 'field': field}}
+        r = engine().send(req)
+        self.assertTrue(r['ok'], r)
+        return r['result']
+
+    def holds(self, cond, point):
+        """Truth of a Maple condition string at a point {name: value string}, decided by the engine's evalb."""
+        text = cond
+        for k, v in point.items():
+            text = re.sub(r'\b{}\b'.format(re.escape(k)), '({})'.format(v), text)
+        r = self.call('evalb', text)
+        self.assertTrue(r['ok'], (cond, point, r))
+        return r['result'] == {'bool': True}
+
+    def assertInDomain(self, res):
+        """A counterexample must satisfy every condition of the common domain."""
+        ce = res['counterexample']
+        for c in res['conditions']:
+            self.assertTrue(self.holds(c, ce), (c, ce))
+
+    def step(self, before, after, var=None, field='real', assume=None):
+        req = {'op': 'check_step', 'before': X(before), 'after': X(after),
+               'opts': {'digits': 10, 'assume': [X(a) for a in (assume or [])], 'field': field}}
+        if var:
+            req['var'] = X(var)
+        r = engine().send(req)
+        self.assertTrue(r['ok'], r)
+        return r['result']
+
+    def sol(self, eqs, cands, field='real'):
+        req = {'op': 'check_solution', 'equations': [X(e) for e in eqs],
+               'candidates': [[X(e) for e in c] for c in cands], 'opts': {'digits': 10, 'assume': [], 'field': field}}
+        r = engine().send(req)
+        self.assertTrue(r['ok'], r)
+        return r['result']
+
+
+class TestVerifyDomains(RigorBase):
+    def test_result_shape(self):
+        r = self.rv('(x+1)^2', 'x^2+2*x+1')
+        for k in ('verdict', 'method', 'conditions', 'domain', 'field', 'assumptions_used', 'limitations'):
+            self.assertIn(k, r)
+        for k in ('lhs', 'rhs', 'common', 'same_domain'):
+            self.assertIn(k, r['domain'])
+        self.assertEqual((r['verdict'], r['field'], r['conditions']), ('equal', 'real', []))
+
+    def test_language_verify_keeps_the_old_shape(self):
+        r = self.verify('(x^2-1)/(x-1)', 'x+1')
+        self.assertEqual(r['verdict'], 'equal')
+        self.assertNotIn('conditions', r)
+
+    def test_A_removable_singularity(self):
+        r = self.rv('(x^2-1)/(x-1)', 'x+1')
+        self.assertEqual((r['verdict'], r['method']), ('equal', 'symbolic'))
+        self.assertEqual(r['conditions'], ['x <> 1'])
+        self.assertEqual(r['domain']['lhs'], 'x <> 1')
+        self.assertEqual(r['domain']['rhs'], 'all real numbers')
+        self.assertIs(r['domain']['same_domain'], False)
+        self.assertEqual(r['domain']['differ_at'], 'x = 1')
+
+    def test_B_sqrt_of_square(self):
+        r = self.rv('sqrt(x^2)', 'x')
+        self.assertEqual(r['verdict'], 'not_equal')
+        x = float(r['counterexample']['x'])
+        self.assertLess(x, 0)
+        self.assertAlmostEqual(float(r['lhs_value']), abs(x))
+        self.assertInDomain(r)
+        self.assertIn('equal if x >= 0', r['suggestion'])
+        r = self.rv('sqrt(x^2)', 'x', assume=['0<=x'])
+        self.assertEqual((r['verdict'], r['method']), ('equal', 'symbolic'))
+        self.assertNotIn('suggestion', r)
+        self.assertEqual(r['assumptions_used'], ['x >= 0'])
+
+    def test_C_log_of_square(self):
+        r = self.rv('ln(x^2)', '2*ln(x)')
+        self.assertEqual(r['verdict'], 'not_equal')
+        # no point of the common domain x > 0 disagrees: the report says where the sides differ instead
+        self.assertNotIn('counterexample', r)
+        w = r['outside_domain']
+        self.assertLess(float(w['point']['x']), 0)
+        self.assertEqual(w['real_side'], 'lhs')
+        self.assertIn('*I', w['rhs_value'])
+        self.assertEqual(r['domain']['lhs'], 'x <> 0')
+        self.assertEqual(r['domain']['rhs'], 'x > 0')
+        self.assertTrue(any('rhs requires x > 0' in n for n in r['notes']), r['notes'])
+        self.assertTrue(r['suggestion'].startswith('equal if x > 0'), r['suggestion'])
+        r = self.rv('ln(x^2)', '2*ln(abs(x))')
+        self.assertEqual((r['verdict'], r['method']), ('equal', 'symbolic'))
+        self.assertEqual(r['conditions'], ['x <> 0'])
+        self.assertIs(r['domain']['same_domain'], True)
+
+    def test_E_trig_identity_with_poles(self):
+        r = self.rv('(1-cos(x)^2)/sin(x)^2', '1')
+        self.assertEqual(r['verdict'], 'equal')
+        self.assertEqual(r['conditions'], ['sin(x) <> 0'])
+        self.assertIs(r['domain']['same_domain'], False)
+        self.assertEqual(r['domain']['differ_at'], 'x = Pi*_Z1 (_Z1 integer)')
+        r = self.rv('tan(x)', 'sin(x)/cos(x)')
+        self.assertEqual(r['verdict'], 'equal')
+        self.assertEqual(r['conditions'], ['cos(x) <> 0'])
+        self.assertIs(r['domain']['same_domain'], True)
+        r = self.rv('tan(x)^2+1', '1/cos(x)^2')
+        self.assertEqual((r['verdict'], r['conditions']), ('equal', ['cos(x) <> 0']))
+
+    def test_F_geometric_series_converges_only_inside(self):
+        r = self.rv('Sum(x^n,n=0..infinity)', '1/(1-x)')
+        self.assertEqual((r['verdict'], r['method']), ('equal', 'symbolic'))
+        self.assertEqual(r['conditions'], ['abs(x) < 1'])
+        self.assertIs(r['domain']['same_domain'], False)
+        self.assertTrue(any('diverges at x = -1 (boundary), x = 1 (boundary)' in n for n in r['notes']), r['notes'])
+        self.assertTrue(any('not proved' in l for l in r['limitations']), r['limitations'])
+
+    def test_series_condition_covered_by_assumptions(self):
+        r = self.rv('Sum(x^n,n=0..infinity)', '1/(1-x)', assume=['0<x', 'x<1'])
+        self.assertEqual((r['verdict'], r['conditions']), ('equal', []))
+
+    def test_series_boundary_point(self):
+        r = self.rv('Sum(x^n/n,n=1..infinity)', '-ln(1-x)')
+        self.assertEqual(r['verdict'], 'equal')
+        self.assertEqual(r['conditions'], ['x <> 1', 'abs(x) <= 1'])
+        self.assertTrue(any('converges at x = -1 (boundary)' in n for n in r['notes']), r['notes'])
+        self.assertTrue(any('diverges at x = 1 (boundary)' in n for n in r['notes']), r['notes'])
+
+    def test_divergent_series(self):
+        r = self.rv('Sum(n,n=1..infinity)', '-1/12')
+        self.assertEqual((r['verdict'], r['method']), ('not_equal', 'convergence'))
+        self.assertTrue(any('diverges' in n for n in r['notes']))
+        r = self.rv('Sum((-1)^n,n=0..infinity)', '1/2')
+        self.assertEqual(r['verdict'], 'not_equal')
+        r = self.rv('Sum(1/n,n=1..infinity)', 'infinity')
+        self.assertEqual(r['verdict'], 'equal')
+
+    def test_undecided_convergence_is_never_equal(self):
+        r = self.rv('Sum(sin(n*x)/n,n=1..infinity)', '(Pi-x)/2')
+        self.assertEqual((r['verdict'], r['method']), ('undetermined', 'convergence'))
+        self.assertTrue(any('converges' in l for l in r['limitations']), r['limitations'])
+
+    def test_integral_existence_condition(self):
+        r = self.rv('Int(exp(-a*t),t=0..infinity)', '1/a')
+        self.assertEqual(r['verdict'], 'equal')
+        self.assertEqual(r['conditions'], ['a > 0'])
+        r = self.rv('Int(x^n,x)', 'x^(n+1)/(n+1)')
+        self.assertEqual(r['verdict'], 'equal')
+        self.assertIn('n <> -1', r['conditions'])
+
+    def test_division_by_zero_and_cancellation(self):
+        # SymPy turns x/x into 1 on input; the condition comes from the request tree
+        r = self.rv('x/x', '1')
+        self.assertEqual((r['verdict'], r['conditions']), ('equal', ['x <> 0']))
+        self.assertEqual(r['domain']['differ_at'], 'x = 0')
+        r = self.rv('(x^2-x)/x', 'x-1')
+        self.assertEqual((r['verdict'], r['conditions']), ('equal', ['x <> 0']))
+        r = self.rv('1/(x-1)', '1/x')
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertInDomain(r)
+        r = self.rv('1/0', '1')
+        self.assertEqual(r['verdict'], 'undetermined')
+
+    def test_sqrt_and_abs(self):
+        r = self.rv('sqrt(x^2)', 'abs(x)')
+        self.assertEqual((r['verdict'], r['method']), ('equal', 'symbolic'))
+        r = self.rv('sqrt(x^2)', 'abs(x)', field='complex')
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertIn('I', r['counterexample']['x'])
+        r = self.rv('sqrt(x-1)', 'x')
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertEqual(r['conditions'], ['x >= 1'])
+        self.assertInDomain(r)
+
+    def test_ln_of_positive_negative_and_zero(self):
+        r = self.rv('ln(x)', 'x-1')
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertGreater(float(r['counterexample']['x']), 0)
+        self.assertInDomain(r)
+        r = self.rv('ln(-1)', 'I*Pi')
+        self.assertEqual(r['verdict'], 'undetermined')
+        self.assertTrue(any('not defined anywhere' in n for n in r['notes']))
+        self.assertEqual(self.rv('ln(-1)', 'I*Pi', field='complex')['verdict'], 'equal')
+        self.assertEqual(self.rv('ln(exp(2))', '2')['verdict'], 'equal')
+        r = self.rv('ln(x)+ln(-x)', 'ln(-x^2)')
+        self.assertNotEqual(r['verdict'], 'equal')
+
+    def test_integer_rational_and_symbolic_exponents(self):
+        r = self.rv('(x^2)^(1/2)', 'x')
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertLess(float(r['counterexample']['x']), 0)
+        r = self.rv('(x^3)^(1/3)', 'x')
+        self.assertNotEqual(r['verdict'], 'equal')
+        r = self.rv('(x^a)^b', 'x^(a*b)')
+        self.assertEqual(r['verdict'], 'equal')
+        self.assertIn('x > 0', r['conditions'])
+        r = self.rv('(x^a)^b', 'x^(a*b)', field='complex')
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertEqual(self.rv('x^2*x^3', 'x^5')['conditions'], [])
+        r = self.rv('x^(-2)', '1/x^2')
+        self.assertEqual((r['verdict'], r['conditions']), ('equal', ['x <> 0']))
+
+    def test_identities_true_only_under_assumptions(self):
+        r = self.rv('ln(x*y)', 'ln(x)+ln(y)')
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertTrue(r['suggestion'].startswith('equal if x > 0 and y > 0'), r['suggestion'])
+        r = self.rv('ln(x*y)', 'ln(x)+ln(y)', assume=['0<x', '0<y'])
+        self.assertEqual((r['verdict'], r['method'], r['conditions']), ('equal', 'symbolic', []))
+        r = self.rv('(-1)^(2*n)', '1')
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertTrue(r['suggestion'].startswith('equal if n::integer'), r['suggestion'])
+        r = self.rv('(-1)^(2*n)', '1', assume=[TYPE('n', 'integer')])
+        self.assertEqual(r['verdict'], 'equal')
+
+    def test_suggestion_never_upgrades_the_verdict(self):
+        r = self.rv('sqrt(x^2)', 'x')
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertIn('symbolic proof', r['suggestion'])
+        self.assertNotIn('suggestion', self.rv('x^2', 'x^3'))
+
+    def test_real_and_complex_fields_differ(self):
+        r = self.rv('sqrt(x)^2', 'x')
+        self.assertEqual((r['verdict'], r['conditions']), ('equal', ['x >= 0']))
+        self.assertIs(r['domain']['same_domain'], False)
+        r = self.rv('sqrt(x)^2', 'x', field='complex')
+        self.assertEqual((r['verdict'], r['conditions']), ('equal', []))
+        r = self.rv('arcsin(x)', 'Pi/2-arccos(x)')
+        self.assertEqual((r['verdict'], r['conditions']), ('equal', ['abs(x) <= 1']))
+
+    def test_unknown_or_unevaluated_never_becomes_equal(self):
+        self.assertEqual(self.rv('Int(f(x),x=0..1)', 'Int(g(x),x=0..1)')['verdict'], 'undetermined')
+        self.assertEqual(self.rv('f(x)', 'g(x)')['verdict'], 'not_equal')
+        self.assertEqual(self.rv('f(x)+1', '1+f(x)')['verdict'], 'equal')
+        r = self.rv('Product(1-1/n^2,n=2..infinity)', '1/3')
+        self.assertEqual(r['verdict'], 'not_equal')
+
+    def test_booleans_and_structures(self):
+        self.assertEqual(self.rv('true', 'false')['verdict'], 'not_equal')
+        r = self.rv('[x/x, 2]', '[1, 2]')
+        self.assertEqual(r['verdict'], 'equal')
+        self.assertTrue(any('scalar' in l for l in r['limitations']))
+
+    def test_counterexamples_lie_inside_the_common_domain(self):
+        for lhs, rhs in [('ln(x)', 'x-1'), ('1/(x-1)', '1/x'), ('sqrt(x-1)', 'x'), ('arcsin(x)', 'x'),
+                         ('ln(x+2)', 'ln(x)+ln(2)'), ('sqrt(1-x^2)', '1-x'), ('tan(x)', 'x')]:
+            r = self.rv(lhs, rhs)
+            self.assertEqual(r['verdict'], 'not_equal', (lhs, rhs, r))
+            self.assertIn('counterexample', r, (lhs, rhs, r))
+            self.assertTrue(r['conditions'], (lhs, rhs, r))
+            self.assertInDomain(r)
+
+    def test_sampling_respects_assumptions(self):
+        r = self.rv('ln(x)', 'x-1', assume=['2<x'])
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertGreater(float(r['counterexample']['x']), 2)
+
+
+class TestCheckStep(RigorBase):
+    def test_D_squaring_adds_a_spurious_solution(self):
+        r = self.step('sqrt(x+1)=x-1', 'x+1=(x-1)^2')
+        self.assertEqual(r['classification'], 'implies')
+        self.assertEqual(r['solutions_before'], 'x = 3')
+        self.assertEqual(r['solutions_after'], 'x = 0, x = 3')
+        self.assertEqual(r['spurious'], 'x = 0')
+        self.assertNotIn('lost', r)
+        self.assertTrue(any('squared' in n for n in r['notes']))
+
+    def test_dividing_by_the_unknown_loses_solutions(self):
+        r = self.step('x^2=x', 'x=1')
+        self.assertEqual((r['classification'], r['lost']), ('implied_by', 'x = 0'))
+        r = self.step('x^2=4', 'x=2')
+        self.assertEqual((r['classification'], r['lost']), ('implied_by', 'x = -2'))
+        r = self.step('x^2=4', 'x=2', assume=['0<x'])
+        self.assertEqual(r['classification'], 'equivalent')
+
+    def test_equivalent_and_not_equivalent(self):
+        self.assertEqual(self.step('2*x+2=4', 'x+1=2')['classification'], 'equivalent')
+        r = self.step('x^2=1', 'x=2')
+        self.assertEqual(r['classification'], 'not_equivalent')
+
+    def test_E_infinite_family_is_reported_as_a_family(self):
+        r = self.step('sin(x)=0', 'x=0')
+        self.assertEqual(r['classification'], 'implied_by')
+        self.assertIs(r['family'], True)
+        self.assertEqual(r['solutions_before'], 'x = Pi*_Z1 (_Z1 integer)')
+        self.assertEqual(r['lost'], 'x = Pi*_Z1 (_Z1 integer) except x = 0')
+
+    def test_conditionset_gives_undetermined(self):
+        r = self.step('exp(x)=x+2', 'x=1')
+        self.assertEqual(r['classification'], 'undetermined')
+        self.assertTrue(any('ConditionSet' in n for n in r['notes']))
+
+    def test_parameters(self):
+        r = self.step('a*x=a*b', 'x=b', var='x')
+        self.assertEqual(r['classification'], 'implied_by')
+        self.assertTrue(any('generic' in l for l in r['limitations']))
+
+    def test_domain_of_the_equation(self):
+        r = self.step('x/x=1', '1=1')
+        self.assertEqual((r['classification'], r['spurious']), ('implies', 'x = 0'))
+        r = self.step('ln(x^2)=0', '2*ln(x)=0')
+        self.assertEqual((r['classification'], r['lost']), ('implied_by', 'x = -1'))
+
+    def test_real_and_complex(self):
+        self.assertEqual(self.step('x^2=-1', 'x=I')['classification'], 'equivalent')
+        r = self.step('x^2=-1', 'x=I', var='x', field='complex')
+        self.assertEqual((r['classification'], r['lost']), ('implied_by', 'x = -I'))
+
+    def test_rewrite_step_uses_verify_with_domains(self):
+        r = self.step('(x^2-1)/(x-1)', 'x+1')
+        self.assertEqual((r['step'], r['classification'], r['conditions']), ('rewrite', 'equivalent', ['x <> 1']))
+        self.assertIs(r['domain']['same_domain'], False)
+
+    def test_needs_var_with_two_names(self):
+        r = engine().send({'op': 'check_step', 'before': X('x+y=1'), 'after': X('x=1-y'),
+                           'opts': {'field': 'real'}})
+        self.assertFalse(r['ok'])
+        self.assertIn('var', r['error'])
+
+
+class TestCheckSolution(RigorBase):
+    def test_spurious_candidate_rejected_and_completeness(self):
+        r = self.sol(['sqrt(x+1)=x-1'], [['x=0'], ['x=3']])
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertEqual(r['rejected'], ['x = 0'])
+        self.assertEqual([c['status'] for c in r['candidates']], ['rejected', 'accepted'])
+        self.assertIs(r['complete'], True)
+
+    def test_candidate_outside_the_domain(self):
+        r = self.sol(['(x^2-1)/(x-1)=2'], [['x=1']])
+        self.assertEqual(r['candidates'][0]['status'], 'rejected')
+        self.assertIn('outside domain', r['candidates'][0]['details'][0])
+        self.assertIn('no solutions', r['completeness'])
+        r = self.sol(['x/x=1'], [['x=0']])
+        self.assertEqual(r['verdict'], 'not_equal')
+
+    def test_family_is_never_complete(self):
+        r = self.sol(['sin(x)=0'], [['x=0'], ['x=Pi']])
+        self.assertEqual(r['verdict'], 'equal')
+        self.assertIs(r['complete'], False)
+        self.assertIs(r['family'], True)
+        self.assertIn('infinitely many', r['completeness'])
+
+    def test_missing_solutions(self):
+        r = self.sol(['x^2-4'], [['x=2']])
+        self.assertEqual((r['verdict'], r['complete']), ('equal', False))
+        self.assertIn('x = -2', r['completeness'])
+
+    def test_systems(self):
+        r = self.sol(['x+y=3', 'x-y=1'], [['x=2', 'y=1']])
+        self.assertEqual((r['verdict'], r['complete']), ('equal', True))
+
+    def test_unsolvable_equation_does_not_claim_completeness(self):
+        r = self.sol(['exp(x)=x+2'], [['x=0']])
+        self.assertEqual(r['verdict'], 'not_equal')
+        self.assertIsNone(r['complete'])
+        self.assertIn('not established', r['completeness'])
+
+
 if __name__ == '__main__':
     unittest.main()

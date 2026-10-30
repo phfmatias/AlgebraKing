@@ -91,6 +91,8 @@ pub struct Interp {
     pub remember: HashMap<(usize, String), Expr>,
     pub defining: Option<String>,
     pub last_error: Option<String>,
+    /// verification mode: sum/product/int reach the engine inert (Sum/Product/Int) so their conditions survive
+    pub inert: bool,
     depth: usize,
     start: Instant,
 }
@@ -120,6 +122,7 @@ impl Interp {
             remember: HashMap::new(),
             defining: None,
             last_error: None,
+            inert: false,
             depth: 0,
             start: Instant::now(),
         };
@@ -1269,6 +1272,12 @@ impl Interp {
 
     /// Call a math function in the engine.
     pub fn engine_call(&mut self, name: &str, args: Vec<Expr>) -> R<Expr> {
+        let name = match name {
+            "sum" if self.inert => "Sum",
+            "product" if self.inert => "Product",
+            "int" if self.inert => "Int",
+            other => other,
+        };
         let d = self.digits();
         let short = name.rsplit(":-").next().unwrap_or(name).to_string();
         let mut ja = Vec::new();

@@ -81,6 +81,9 @@ Request:
 ```json
 {"id": 7, "op": "call", "name": "int", "args": [EXPR, ...], "opts": {"digits": 10, "assume": []}}
 {"id": 8, "op": "verify", "lhs": EXPR, "rhs": EXPR, "opts": {"digits": 10, "assume": [EXPR, ...]}}
+{"id": 8, "op": "verify", "lhs": EXPR, "rhs": EXPR, "lhs_raw": EXPR?, "rhs_raw": EXPR?, "opts": {..., "field": "real"}}
+{"id": 12, "op": "check_step", "before": EXPR, "after": EXPR, "var": EXPR?, "before_raw": EXPR?, "after_raw": EXPR?, "opts": {..., "field": "real"}}
+{"id": 13, "op": "check_solution", "equations": [EXPR, ...], "candidates": [[EXPR, ...], ...], "equations_raw": [EXPR, ...]?, "opts": {..., "field": "real"}}
 {"id": 9, "op": "latex",  "expr": EXPR}
 {"id": 10, "op": "pretty", "expr": EXPR, "width": 80}
 {"id": 11, "op": "ping"}
@@ -104,6 +107,35 @@ Response:
                                    "counterexample": {"x": "1.3", "...": "..."} }}
 {"id": 9, "ok": true,  "result": "\\frac{x^{3}}{3}"}
 ```
+
+`verify` **without** `opts.field` is the language-level check (`verify(a, b)`, the engine's own
+`is`/`testeq`) and keeps the shape above. **With** `opts.field` (`"real"` or `"complex"`; the MCP
+tools always send it, `real` by default) it is the domain-aware check described under
+*verify algorithm*; the result keeps `verdict`, `method`, `difference`, `counterexample`, `note`
+and adds:
+
+```json
+{"verdict": "equal", "method": "symbolic", "field": "real",
+ "conditions": ["x <> 1"],
+ "domain": {"lhs": "x <> 1", "rhs": "all real numbers", "common": "x <> 1",
+            "same_domain": false, "differ_at": "x = 1"},
+ "counterexample": {"x": "-2.1"}, "lhs_value": "2.1", "rhs_value": "-2.1",
+ "outside_domain": {"point": {"x": "-2.1"}, "lhs_value": "...", "rhs_value": "...", "real_side": "lhs"},
+ "suggestion": "equal if x >= 0 -- ...", "notes": ["..."], "limitations": ["..."],
+ "assumptions_used": ["x > 0"]}
+```
+
+Strings are Maple 1-D syntax. `conditions` are the existence conditions of the common domain;
+`counterexample` is only ever a point inside it; `outside_domain` is a point where one side is real
+and in its domain while the other is defined but not real; `same_domain` is `null` when it could
+not be decided. `*_raw` are the user's input trees before the interpreter evaluated them (sent only
+when they contain no assigned names): they let the engine see conditions that evaluation cancels
+(`x/x`, `sqrt(x)^2`, `exp(ln(x))`). `check_step` adds `classification` (`equivalent`, `implies`,
+`implied_by`, `not_equivalent`, `undetermined`), `step` (`equation` or `rewrite`),
+`solutions_before`, `solutions_after`, `spurious`, `lost`, `family` and `domain: {before, after}`;
+`check_solution` adds `candidates` (point, status `accepted|rejected|undetermined`, details),
+`rejected`, `all_solutions`, `complete` (true/false/null) and `completeness`. Infinite families
+are written `x = Pi*_Z1 (_Z1 integer)`.
 Error strings follow Maple style without the leading `Error, ` (Rust adds it).
 
 ### EXPR (JSON expression tree)
@@ -241,6 +273,56 @@ Function-name mapping goes through one table so adding a function is one line.
    One point clearly non-zero → `not_equal` with that point as `counterexample`.
 4. Otherwise `undetermined`. Never raise for a math reason.
 
+That is `verify` without `opts.field`. With a field (MCP tools), `RigorMixin.verifyRich` in
+`engine.py` does:
+
+1. Real field: every free symbol becomes a real SymPy symbol (session assumptions kept).
+2. Inert `Sum`/`Product`/`Int` (the MCP server evaluates the user's input with `Interp::inert`,
+   so `sum`, `product` and `int` reach the engine inert; normal evaluation is untouched) are
+   evaluated with `doit()` keeping SymPy's `Piecewise`: the convergent branch replaces the node and
+   its condition (`abs(x) < 1`) joins the conditions; the boundary points of the condition and two
+   points outside it are tested with `is_convergent` and reported (outside the condition this is a
+   sampled check, and the report says so). A series that SymPy evaluates to `oo` or proves
+   divergent has no value; one whose convergence cannot be decided makes the verdict
+   `undetermined`, never `equal`. A generic `Piecewise` (`x^(n+1)/(n+1)` if `n <> -1`) keeps the
+   generic branch and its condition.
+3. `DomainMixin` collects existence conditions from the request trees (`*_raw` too) and from the
+   SymPy tree: denominators `<> 0`; `ln` argument `> 0` (real) or `<> 0` (complex); even roots and
+   non-integer powers `>= 0` (`> 0` with a negative exponent; `> 0` for a symbolic exponent over
+   the reals); `tan`/`sec` need `cos <> 0`, `cot`/`csc` need `sin <> 0`; `arcsin`/`arccos`
+   `abs <= 1`, `arctanh` `abs < 1`, `arccosh >= 1`, `arcsec`/`arccsc` `abs >= 1`, `arccoth`
+   `abs > 1`; the conditions of `Piecewise` results. Conditions already guaranteed by the declared
+   assumptions are dropped, and (one variable) those implied by the others. Excluded sets come from
+   `solveset` over the field; when it cannot solve them the condition stays symbolic
+   (`sin(x) <> 0`) and a limitation says so.
+4. Symbolic zero test of `lhs - rhs` with the symbols strengthened by the simple conditions
+   (`x > 0` makes `x` positive): this proves equality on the common domain only.
+5. Numeric sampling (real points, or interleaved real and complex points for `complex`) keeps only
+   points where both sides are defined and satisfy their conditions (and are real over the reals);
+   a disagreement there is the counterexample. A point where one side is real and in its domain
+   while the other is defined but not real (`2*ln(x)` at `x < 0`) is reported as `outside_domain`
+   and makes the verdict `not_equal` with an explanation; a point where the other side is undefined
+   (pole, 0/0, divergent series) only restricts the domain.
+6. `equal` = equal on the common domain; the domains of both sides are compared (one variable: as
+   sets; several: by the condition lists and the sampled points) and a change is reported
+   (`same_domain: false`, `differ_at`).
+7. When the verdict is not `equal` and there are at most 2 free symbols, a fixed menu per symbol
+   (`x >= 0`, `x > 0`, `x < 0`, `x::integer`, plus the same property for both symbols) is tried
+   with steps 2-4 only (a symbolic proof) and a sampled check that no outside-domain point
+   disagrees; the assumption leaving the fewest extra conditions becomes `suggestion`. It never
+   changes the verdict.
+
+`check_step` (`StepMixin`) solves both equations with `solveset` over the field, intersected with
+each equation's domain and with the interval allowed by the assumptions, and compares the sets
+(`Complement` both ways). A `ConditionSet`, or a comparison SymPy cannot settle, gives
+`undetermined`. Explanations: the new equation is the old one squared (spurious solutions of
+`lhs = -rhs`), or the step divided/multiplied by a rational factor that vanishes. Parameters other
+than `var` are generic for `solveset` (stated as a limitation); a factor that depends only on them
+is reported (`a*x = a*b` to `x = b` loses every `x` when `a = 0`). Two expressions are a rewrite
+step and go through the domain-aware verify. `check_solution` checks each candidate in the original
+equations (domain conditions first, then the residual) and, for one equation in one unknown or a
+polynomial system, compares the accepted candidates with the full solution set.
+
 ## MCP server
 
 Protocol: JSON-RPC 2.0 over stdio, newline-delimited, MCP revision `2025-06-18`
@@ -253,15 +335,17 @@ text content; math also returned in LaTeX when useful. Tools:
 | tool | input | does |
 |---|---|---|
 | `algebra_eval` | `code` (Maple syntax), `session?` | runs statements, returns each shown result in 1-D, plus LaTeX of the last |
-| `verify_equal` | `lhs`, `rhs`, `assumptions?` (e.g. `"x>0, n::integer"`), `session?` | verdict + method + counterexample |
+| `verify_equal` | `lhs`, `rhs`, `assumptions?` (e.g. `"x>0, n::integer"`), `field?`, `session?` | verdict + method + conditions + domain + in-domain counterexample + suggestion + limitations |
 | `check_derivative` | `f`, `derivative`, `var` | verify `diff(f,var) = derivative` |
 | `check_integral` | `integrand`, `antiderivative`, `var` | verify `diff(F,var) = integrand` (up to a constant) |
-| `check_solution` | `equations`, `solution` | substitute, verify every equation |
+| `check_solution` | `equations`, `solution` (one candidate, or several as `[x=0, x=3]`) | candidates checked in the original equations and their domain; rejected ones; completeness |
+| `check_step` | `before`, `after`, `var?`, `assumptions?`, `field?` | equivalent / implies / implied_by / not_equivalent / undetermined, with the solution sets |
 | `check_ode_solution` | `ode`, `solution`, `func` (e.g. `y(x)`) | like Maple `odetest` |
 | `algebra_reset` | `session?` | `restart` |
 
-Tool descriptions must tell Claude to use Maple syntax and to send the user's step
-exactly as written. Register with:
+Tool descriptions must tell Claude to use Maple syntax, to send the user's step
+exactly as written, and to read `conditions`, `domain`, `suggestion` and `limitations`, not only
+the verdict. Every check tool takes `field` (`real` default, `complex`). Register with:
 `claude mcp add algebraking -s user -- ~/MyApps/AlgebraKing/target/release/algebraking mcp`.
 
 ## Code style

@@ -93,15 +93,17 @@ Then ask Claude things like *"Confere se a derivada de x\*exp(x) é (x+1)\*exp(x
 | Tool | Arguments | Purpose |
 |---|---|---|
 | `algebra_eval` | `code`, `session?` | Run Maple statements in a persistent session; returns 1-D results plus LaTeX |
-| `verify_equal` | `lhs`, `rhs`, `assumptions?`, `session?` | `equal` / `not_equal` / `undetermined`, method, counterexample |
+| `verify_equal` | `lhs`, `rhs`, `assumptions?`, `field?`, `session?` | `equal` / `not_equal` / `undetermined` on the common domain, with its conditions (`x <> 1`, `abs(x) < 1`), domain comparison, in-domain counterexample, suggested assumption |
 | `check_derivative` | `f`, `derivative`, `var` | Is `diff(f, var)` the claimed derivative? |
 | `check_integral` | `integrand`, `antiderivative`, `var` | Does the antiderivative differentiate back to the integrand? |
-| `check_solution` | `equations`, `solution` | Substitute the claimed solution into every equation |
+| `check_solution` | `equations`, `solution` | Check candidates in the original equations and their domain; rejected candidates; are they all the solutions? |
+| `check_step` | `before`, `after`, `var?`, `assumptions?`, `field?` | Classify a step: equivalent / implies (spurious solutions) / implied_by (lost solutions) / not_equivalent / undetermined |
 | `check_ode_solution` | `ode`, `solution`, `func` | Like `odetest`, with initial conditions |
 | `algebra_reset` | `session?` | `restart` a session |
 
-A numeric `equal` is strong evidence, not a proof; the verdict always says which
-method decided. Claude Desktop setup and example prompts are in the
+`field` is `real` (default) or `complex`. `equal` means equal where both sides are
+defined: read the `conditions` and `domain` lines. A numeric `equal` is strong evidence,
+not a proof; the verdict always says which method decided. Claude Desktop setup and example prompts are in the
 [guide](docs/GUIA_USUARIO.md).
 
 ## Documentation

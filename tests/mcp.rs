@@ -81,6 +81,7 @@ fn handshake_and_tool_list() {
         "check_integral",
         "check_solution",
         "check_ode_solution",
+        "check_step",
         "algebra_reset",
     ] {
         assert!(names.contains(&want), "missing tool {}", want);
@@ -172,6 +173,54 @@ fn verification_tools() {
     assert!(text(by_id(12)).starts_with("The solution does NOT satisfy the ODE"), "{}", text(by_id(12)));
     let t13 = text(by_id(13));
     assert!(t13.starts_with("-x*cos(x)+sin(x)") && t13.contains("LaTeX:"), "{}", t13);
+}
+
+#[test]
+fn verification_reports_domains_steps_and_convergence() {
+    if !have_engine() {
+        eprintln!("skipping: python3 with sympy is not available");
+        return;
+    }
+    let r = session(
+        &[
+            init(),
+            call(2, "verify_equal", json!({"lhs": "(x^2-1)/(x-1)", "rhs": "x+1"})),
+            call(3, "check_step", json!({"before": "sqrt(x+1) = x-1", "after": "x+1 = (x-1)^2"})),
+            call(4, "verify_equal", json!({"lhs": "sum(x^n, n=0..infinity)", "rhs": "1/(1-x)"})),
+            call(5, "algebra_eval", json!({"code": "sum(x^n, n=0..infinity);"})),
+            call(6, "verify_equal", json!({"lhs": "ln(x^2)", "rhs": "2*ln(x)"})),
+            call(7, "check_solution", json!({"equations": "sqrt(x+1) = x-1", "solution": "[x=0, x=3]"})),
+            call(8, "verify_equal", json!({"lhs": "x/x", "rhs": "1"})),
+            call(9, "check_step", json!({"before": "sin(x) = 0", "after": "x = 0"})),
+            call(10, "verify_equal", json!({"lhs": "sqrt(x^2)", "rhs": "abs(x)", "field": "complex"})),
+        ],
+        &[],
+    );
+    let by_id = |id: i64| text(r.iter().find(|m| m["id"] == id).unwrap_or_else(|| panic!("no reply {}", id)));
+    let t = by_id(2);
+    assert!(t.starts_with("verdict: equal"), "{}", t);
+    assert!(t.contains("conditions: x <> 1"), "{}", t);
+    assert!(t.contains("same domain: no, they differ where x = 1"), "{}", t);
+    let t = by_id(3);
+    assert!(t.starts_with("classification: implies"), "{}", t);
+    assert!(t.contains("spurious solutions (added by the step): x = 0"), "{}", t);
+    assert!(t.contains("solutions before: x = 3"), "{}", t);
+    let t = by_id(4);
+    assert!(t.starts_with("verdict: equal"), "{}", t);
+    assert!(t.contains("conditions: abs(x) < 1"), "{}", t);
+    assert!(t.contains("lhs: Sum(x^n, n = 0 .. infinity)"), "{}", t);
+    // normal evaluation is unchanged (Maple also returns the closed form)
+    assert!(by_id(5).starts_with("1/(-x+1)") || by_id(5).starts_with("-1/(x-1)"), "{}", by_id(5));
+    let t = by_id(6);
+    assert!(t.starts_with("verdict: not_equal") && !t.contains("counterexample:"), "{}", t);
+    assert!(t.contains("outside the common real domain") && t.contains("suggestion: equal if x > 0"), "{}", t);
+    let t = by_id(7);
+    assert!(t.starts_with("Some candidates are REJECTED: x = 0."), "{}", t);
+    assert!(t.contains("completeness: the accepted candidates are all the solutions"), "{}", t);
+    assert!(by_id(8).contains("conditions: x <> 0"), "{}", by_id(8));
+    let t = by_id(9);
+    assert!(t.contains("solutions before: x = Pi*_Z1 (_Z1 integer)"), "{}", t);
+    assert!(by_id(10).starts_with("verdict: not_equal"), "{}", by_id(10));
 }
 
 /// A python wrapper whose first launch hangs; later launches run the real python3.

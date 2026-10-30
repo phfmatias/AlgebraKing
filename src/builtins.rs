@@ -2011,6 +2011,14 @@ impl Interp {
     /// Call the engine's verify (lhs = rhs) with extra assumptions.
     pub fn verify(&mut self, lhs: &Expr, rhs: &Expr, extra: &[Expr]) -> R<Value> {
         let d = self.digits();
+        let l = crate::engine::to_json(lhs, d).map_err(Exc::Err)?;
+        let r = crate::engine::to_json(rhs, d).map_err(Exc::Err)?;
+        self.check_request(json!({"op": "verify", "lhs": l, "rhs": r}), extra, None, "verify")
+    }
+
+    /// Send a verification request (verify, check_step, check_solution) with the session assumptions
+    /// plus `extra`; `field` ("real" or "complex") selects the domain-aware verification.
+    pub fn check_request(&mut self, mut req: Value, extra: &[Expr], field: Option<&str>, ctx: &str) -> R<Value> {
         let saved = self.assumptions.clone();
         for a in extra {
             if let Err(e) = self.push_assumption(a.clone(), true) {
@@ -2020,9 +2028,11 @@ impl Interp {
         }
         let opts = self.opts();
         self.assumptions = saved;
-        let opts = opts?;
-        let l = crate::engine::to_json(lhs, d).map_err(Exc::Err)?;
-        let r = crate::engine::to_json(rhs, d).map_err(Exc::Err)?;
-        self.engine_request(json!({"op": "verify", "lhs": l, "rhs": r, "opts": opts}), "verify")
+        let mut opts = opts?;
+        if let Some(f) = field {
+            opts["field"] = json!(f);
+        }
+        req["opts"] = opts;
+        self.engine_request(req, ctx)
     }
 }
