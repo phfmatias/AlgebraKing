@@ -1,6 +1,6 @@
 # AlgebraKing — Guia do usuário
 
-Guia completo do AlgebraKing para quem já conhece o Maple. Todos os exemplos abaixo foram
+Guia completo do AlgebraKing. Todos os exemplos abaixo foram
 executados no binário `algebraking` (versão 0.0.1) e a saída mostrada é a saída real, em
 formato 1-D (o formato de scripts, de `-e` quando a saída não é um terminal e de
 `interface(prettyprint=0)`; veja "Primeiros passos").
@@ -13,7 +13,7 @@ formato 1-D (o formato de scripts, de `-e` quando a saída não é um terminal e
 4. [Linguagem](#4-linguagem)
 5. [Matemática](#5-matemática)
 6. [Usando com o Claude (MCP)](#6-usando-com-o-claude-mcp)
-7. [Diferenças em relação ao Maple](#7-diferenças-em-relação-ao-maple)
+7. [Limitações conhecidas](#7-limitações-conhecidas)
 8. [Solução de problemas](#8-solução-de-problemas)
 9. [Validação](#9-validação)
 
@@ -21,29 +21,29 @@ formato 1-D (o formato de scripts, de `-e` quando a saída não é um terminal e
 
 ## 1. O que é
 
-AlgebraKing é um sistema de álgebra computacional para o terminal, **no estilo do Maple**:
-a linguagem, os nomes das funções, a ordem dos argumentos e as convenções de retorno seguem o
-Maple, de modo que código Maple do dia a dia roda como está. Ele foi escrito do zero, em
-**clean room**: nenhum código, biblioteca (`.mla`), texto de ajuda ou dado do Maple foi usado;
-a compatibilidade vem só da documentação pública e do conhecimento geral da linguagem.
+AlgebraKing é um sistema de álgebra computacional para o terminal, inspirado na linguagem
+Maple. Foi escrito do zero, em **clean room** (nenhum código, binário ou documentação do Maple
+foi usado), e reproduziu 257/257 veredictos de uma bateria de verificação real, originalmente
+executada no Maple 18. A linguagem, os nomes das funções, a ordem dos argumentos e as
+convenções de retorno são os do AlgebraKing, descritos neste guia.
 
 A arquitetura tem duas metades:
 
 - **Rust** cuida da *linguagem*: lexer, parser, avaliação (variáveis, procedimentos, laços,
-  `%`, pacotes, `with`), impressão no formato do Maple e o servidor MCP.
+  `%`, pacotes, `with`), impressão no formato 1-D e o servidor MCP.
 - **Python + SymPy** cuida da *matemática*: cada função matemática (`int`, `solve`, `dsolve`,
   `Eigenvalues`, ...) é uma chamada a um motor (`engine/engine.py`) embutido no binário, que
-  traduz as funções do Maple para o SymPy e devolve o resultado na convenção do Maple.
+  traduz as funções do AlgebraKing para o SymPy e devolve o resultado na convenção do AlgebraKing.
 
 **Por que existe?** O uso principal é *conferir contas*: o Claude pega um passo da sua dedução
 (derivada, integral, solução de EDO, identidade) e pergunta ao AlgebraKing, por MCP, se está
 certo, recebendo `equal`, `not_equal` (com contraexemplo) ou `undetermined`. O segundo uso é
-um REPL de terminal que parece o Maple de linha de comando. Quando o programa não sabe fazer
-algo, ele devolve a expressão sem avaliar (como o Maple) ou dá erro; a regra é nunca devolver
+um REPL de terminal. Quando o programa não sabe fazer
+algo, ele devolve a expressão sem avaliar ou dá erro; a regra é nunca devolver
 uma resposta errada com confiança.
 
-Fora do escopo: GUI, worksheets (`.mw`), janela de gráficos (`plot`), Maplets, geração de
-código, MapleSim, e formatação byte a byte idêntica à do Maple.
+Fora do escopo: interface gráfica, worksheets, janela de gráficos (`plot`) e geração de
+código (veja a seção 7).
 
 ---
 
@@ -138,7 +138,7 @@ vira `  `. `Ctrl-C` descarta a entrada pendente, `Ctrl-D` (ou `quit;`) sai. O hi
 
 ```text
 $ algebraking
-AlgebraKing 0.0.1 - Maple-style symbolic math (SymPy engine). Type quit; to leave.
+AlgebraKing 0.0.1 - symbolic math (SymPy engine). Type quit; to leave.
 > f := x -> x^2*exp(-x):
 > int(f(x), x=0..infinity);
 2
@@ -168,7 +168,7 @@ AlgebraKing 0.0.1 - Maple-style symbolic math (SymPy engine). Type quit; to leav
 
 ### `;` mostra, `:` silencia
 
-Como no Maple, `;` mostra o resultado e `:` o suprime (a última instrução pode ficar sem
+`;` mostra o resultado e `:` o suprime (a última instrução pode ficar sem
 terminador):
 
 ```text
@@ -193,12 +193,12 @@ x^2+y
 ### 2-D ou 1-D
 
 No REPL, e em scripts/`-e` quando a saída **é um terminal**, os resultados saem em 2-D (como
-acima). Quando a saída vai para um pipe ou arquivo, saem em 1-D no formato do Maple. Para
+acima). Quando a saída vai para um pipe ou arquivo, saem em 1-D. Para
 forçar: `interface(prettyprint=0)` (1-D) ou `interface(prettyprint=1)` (2-D).
 
 ### Scripts `.mpl`
 
-Um script é um arquivo de texto com instruções Maple. O programa imprime os resultados das
+Um script é um arquivo de texto com instruções da linguagem. O programa imprime os resultados das
 instruções terminadas em `;` e **para no primeiro erro, com código de saída 1**.
 
 ```text
@@ -327,8 +327,7 @@ if 3 > 2 then "yes" else "no" end if;
 "yes"
 ```
 
-`while`, `break`, `next`, `elif`, e as formas curtas `fi` e `od` também funcionam. Como no
-Maple, as instruções de um laço no nível superior terminadas em `;` mostram o resultado:
+`while`, `break`, `next`, `elif`, e as formas curtas `fi` e `od` também funcionam. As instruções de um laço no nível superior terminadas em `;` mostram o resultado:
 
 ```text
 for i to 3 do i; end do;
@@ -353,7 +352,7 @@ for i to 3 do i; end do;
 | `sum(i^2, i=1..10); add(i^2, i=1..10);` | `385`<br>`385` |
 
 Com limites simbólicos, `add`/`mul` passam para `sum`/`product` do motor.
-`eval(e, x=a)`, `subs(x=a, e)` (ordem do Maple) e `subsop` também existem:
+`eval(e, x=a)`, `subs(x=a, e)` (nessa ordem) e `subsop` também existem:
 
 ```text
 eval(x^2+y, x=2); subs(x=2, x^2+y); eval(x^2+y, [x=1,y=2]);
@@ -392,7 +391,7 @@ O produto matricial é o ponto `.`; `M[1,2]` indexa.
 
 ### Pacotes: `with`, `:-` e `[]`
 
-Há três formas de chamar uma função de pacote, e, como no Maple, o nome curto só funciona
+Há três formas de chamar uma função de pacote, e o nome curto só funciona
 **depois de `with`**:
 
 ```text
@@ -409,11 +408,10 @@ Determinant(<<1|2>,<3|4>>);
 Determinant(Matrix(2, 2, [[1, 2], [3, 4]]))
 ```
 
-(A última não resolve o nome curto e devolve a chamada sem avaliar, como o Maple.) Pacotes
+(A última não resolve o nome curto e devolve a chamada sem avaliar.) Pacotes
 reconhecidos: `LinearAlgebra`, `inttrans`, `VectorCalculus`, `student`, `numtheory`,
 `Groebner`, `combinat`, `ListTools`, `DEtools`. Quando dois pacotes exportam o mesmo
-nome (por exemplo `Basis`, em `LinearAlgebra` e `Groebner`), vale o último carregado com `with`,
-como no Maple.
+nome (por exemplo `Basis`, em `LinearAlgebra` e `Groebner`), vale o último carregado com `with`.
 
 ### `read`
 
@@ -492,8 +490,7 @@ evalf(Pi, 50);
 3.1415926535897932384626433832795028841971693993751
 ```
 
-`Digits` vale 10 por padrão; `evalf(e, n)` e `evalf[n](e)` avaliam `e` com `Digits = n`,
-como no Maple.
+`Digits` vale 10 por padrão; `evalf(e, n)` e `evalf[n](e)` avaliam `e` com `Digits = n`.
 
 ### `printf`, `sprintf`, `print`, `lprint`, `latex`
 
@@ -514,7 +511,7 @@ Especificadores: `%d %a %f %e %g %s`. `kernelopts(version)` devolve `"AlgebraKin
 
 ### Precedência e operadores
 
-Precedência do Maple: `||`, `$`, `!`, `^`/`**` (**não associativo**), `-` unário, `*` `/`,
+Precedência dos operadores: `||`, `$`, `!`, `^`/`**` (**não associativo**), `-` unário, `*` `/`,
 `+` `-`, `mod`, `..`, relações, `not`, `and`, `or`, `xor`, `implies`, `->`, `,`, `:=`.
 
 ```text
@@ -609,7 +606,7 @@ Funções: `ifactor`, `ifactors`, `isprime`, `ithprime`, `nextprime`, `prevprime
 | `lucas(5); bernoulli(4); euler(4); harmonic(5);` | `11`<br>`-1/30`<br>`5`<br>`137/60` |
 | `pochhammer(3, 2); doublefactorial(5);` | `12`<br>`15` |
 
-*Nota:* como no Maple, `fibonacci` pertence a `combinat` (`combinat[fibonacci](10)` ou
+*Nota:* `fibonacci` pertence a `combinat` (`combinat[fibonacci](10)` ou
 `with(combinat)`; sem isso a chamada volta sem avaliar). Depois de `with(numtheory)`, `phi(36)`
 e `divisors(12)` funcionam sem prefixo.
 
@@ -705,8 +702,7 @@ Com `B := <<1|2>,<3|4>>`:
 | `SingularValues(<<3\|0>,<0\|4>>);` | `Vector[column]([4, 3])` |
 | `IsDefinite(<<2\|0>,<0\|3>>, query='positive_definite');` | `true` |
 
-Matrizes de ponto flutuante usam um resolvedor numérico (mpmath) com no mínimo 15 dígitos,
-como o caminho LAPACK do Maple.
+Matrizes de ponto flutuante usam um resolvedor numérico (mpmath) com no mínimo 15 dígitos.
 
 ### Transformadas (`inttrans`)
 
@@ -828,13 +824,13 @@ Reinicie o Claude Desktop depois de salvar.
 
 ### As 8 ferramentas
 
-Todas aceitam sintaxe Maple. Os argumentos com `?` são opcionais. `session?` escolhe uma
+Todas aceitam a sintaxe do AlgebraKing. Os argumentos com `?` são opcionais. `session?` escolhe uma
 sessão nomeada (padrão `"main"`). Todas as ferramentas de conferência aceitam `field?`: `real`
 (padrão, porque contas de física e química usam variáveis reais) ou `complex`.
 
 | Ferramenta | Argumentos | O que faz |
 |---|---|---|
-| `algebra_eval` | `code`, `session?` | executa instruções Maple numa sessão persistente e devolve cada resultado em 1-D, mais o LaTeX do último |
+| `algebra_eval` | `code`, `session?` | executa instruções do AlgebraKing numa sessão persistente e devolve cada resultado em 1-D, mais o LaTeX do último |
 | `verify_equal` | `lhs`, `rhs`, `assumptions?`, `field?`, `session?` | decide se `lhs = rhs` no domínio comum: veredito, método, condições, domínio de cada lado, diferença, contraexemplo dentro do domínio, sugestão de hipótese e limitações |
 | `check_derivative` | `f`, `derivative`, `var` (+ `assumptions?`, `field?`, `session?`) | confere se `diff(f, var)` é a derivada declarada |
 | `check_integral` | `integrand`, `antiderivative`, `var` (+ `assumptions?`, `field?`, `session?`) | confere se `diff(antiderivative, var)` é o integrando (primitiva correta a menos de constante) |
@@ -857,7 +853,7 @@ não basta. Leia também:
 |---|---|
 | `method` | `symbolic` (prova), `numeric` (amostragem), `convergence`, `solveset`, `domain` |
 | `field` | corpo usado: `real` ou `complex` |
-| `conditions` | condições de existência do domínio comum, em sintaxe Maple (`x <> 1`, `abs(x) < 1`, `sin(x) <> 0`). `equal` vale **só** onde elas valem |
+| `conditions` | condições de existência do domínio comum, na sintaxe do AlgebraKing (`x <> 1`, `abs(x) < 1`, `sin(x) <> 0`). `equal` vale **só** onde elas valem |
 | `domain` | domínio de cada lado, o comum e se os dois lados têm o mesmo domínio natural (`same domain: no, they differ where x = 1`) |
 | `counterexample` | só aparece com ponto **dentro** do domínio comum, com os valores de cada lado |
 | `outside the common real domain` | ponto em que um lado é real e está no seu domínio, e o outro não é real (por exemplo `2*ln(x)` com `x < 0`) |
@@ -867,7 +863,7 @@ não basta. Leia também:
 
 `sum`, `product` e `int` chegam ao motor **inertes** (`Sum`, `Product`, `Int`) nas ferramentas de
 conferência, para que a condição de convergência não se perca; em `algebra_eval` e no REPL
-continuam devolvendo a forma fechada, como o Maple.
+continuam devolvendo a forma fechada.
 
 #### Exemplos de pedido e resposta real
 
@@ -941,7 +937,7 @@ rhs: 1/(-x+1)
 
 Identidades trigonométricas com polos trazem a condição: `(1-cos(x)^2)/sin(x)^2 = 1` sai `equal`
 com `conditions: sin(x) <> 0` e a nota `sin(x) <> 0: excludes x = Pi*_Z1 (_Z1 integer)` (`_Z1`
-é um inteiro qualquer, como no Maple).
+é um inteiro qualquer).
 
 **`check_step`** — *"Confere o passo: de sqrt(x+1) = x-1 elevei ao quadrado e cheguei em
 x+1 = (x-1)^2."* (`before: "sqrt(x+1) = x-1"`, `after: "x+1 = (x-1)^2"`)
@@ -1098,8 +1094,7 @@ completa). É heurística: `equal` numérico (pontos de amostra), a divergência
 uma série (testada em pontos), a comparação de domínios com duas ou mais variáveis e a
 classificação de `check_step` quando há parâmetros (o `solveset` os trata como genéricos). O
 `check_step` e a completude do `check_solution` dependem do `solveset`: quando ele devolve
-`ConditionSet`, a resposta é `undetermined` / *not established*, nunca um palpite. Por fim, como
-no Maple, a linguagem simplifica automaticamente `x/x` para `1` e `sqrt(x)^2` para `x`; a
+`ConditionSet`, a resposta é `undetermined` / *not established*, nunca um palpite. Por fim, a linguagem simplifica automaticamente `x/x` para `1` e `sqrt(x)^2` para `x`; a
 ferramenta recupera essas condições lendo a entrada antes da avaliação, mas não quando a
 expressão vem de uma variável já atribuída na sessão.
 
@@ -1139,28 +1134,28 @@ ou na chave `env` do JSON do Claude Desktop.
 
 ---
 
-## 7. Diferenças em relação ao Maple
+## 7. Limitações conhecidas
 
-Lista honesta do que o usuário de Maple vai notar. O objetivo é resposta correta primeiro;
-formato idêntico ao Maple é secundário.
+Lista honesta do que o AlgebraKing faz de modo particular ou não faz. O objetivo é resposta
+correta primeiro; o formato da saída é secundário.
 
-| Tema | AlgebraKing | Maple |
-|---|---|---|
-| **`solve`** | devolve todas as soluções que encontra, também as de vários ramos: `solve(sin(x)=0, x)` → `Pi, 0` | dá só a solução principal (`0`) |
-| **Ordem das soluções** | `solve(x^2-5*x+6=0, x)` → `3, 2` | `2, 3` |
-| **Ordem de termos e fatores** | vem da forma interna do SymPy: `(x-3)*(x-2)*(x-1)`, `-sqrt(5)/2+5/2` | `(x-1)*(x-2)*(x-3)`, `5/2-sqrt(5)/2` |
-| **Formato de ponto flutuante** | `0.1362`; `1.5*10^20` | `.1362`; `0.15e21` |
-| **Nomes com suposição** | `assume(x>0)` não marca o nome: `x` aparece como `x` | aparece `x~` |
-| **`Heaviside(0)`** | `1/2` | por padrão não é avaliado (o valor depende da versão/configuração) |
-| **Últimos dígitos** | resultados de ponto flutuante de 15 dígitos (matrizes numéricas, `HFloat`) podem diferir do Maple nos dois últimos dígitos | |
+| Tema | Comportamento do AlgebraKing |
+|---|---|
+| **`solve`** | devolve todas as soluções que encontra, também as de vários ramos: `solve(sin(x)=0, x)` → `Pi, 0` |
+| **Ordem das soluções** | `solve(x^2-5*x+6=0, x)` → `3, 2` |
+| **Ordem de termos e fatores** | vem da forma interna do SymPy: `(x-3)*(x-2)*(x-1)`, `-sqrt(5)/2+5/2` |
+| **Formato de ponto flutuante** | `0.1362`; `1.5*10^20` |
+| **Nomes com suposição** | `assume(x>0)` não marca o nome: `x` aparece como `x` |
+| **`Heaviside(0)`** | devolve `1/2` |
+| **Últimos dígitos** | resultados de ponto flutuante de 15 dígitos (matrizes numéricas, `HFloat`) podem variar nos dois últimos dígitos |
 
-Funções e pacotes que **não existem** (a chamada volta sem avaliar ou dá erro de sintaxe):
-`inttrans:-hilbert`, `LegendreQ`, o pacote `Student` (`Student[Calculus1]`), `isolate` (volta
-sem avaliar), `DEtools` gráficos. Também **não há**: gráficos (`plot`, `plots`), interface
-gráfica, worksheets `.mw`, Maplets, geração de código, MapleSim e as bibliotecas
+Funções e pacotes que **não estão disponíveis** (a chamada volta sem avaliar ou dá erro de
+sintaxe): `inttrans:-hilbert`, `LegendreQ`, o pacote `Student` (`Student[Calculus1]`),
+`isolate` (volta sem avaliar), `DEtools` gráficos. Também **não há**: gráficos (`plot`,
+`plots`), interface gráfica, worksheets `.mw`, geração de código e as bibliotecas
 `Statistics`/`StringTools` (o nome do pacote é reconhecido, mas sem funções).
 
-A saída em 1-D tenta seguir o Maple, mas não é byte a byte idêntica.
+A saída em 1-D tem formato próprio, estável entre execuções.
 
 ---
 
@@ -1229,7 +1224,7 @@ echo '{"id":1,"op":"ping"}' | python3 engine/engine.py
 
 ## 9. Validação
 
-O AlgebraKing reproduziu **257/257** verificações de uma suíte de verificação em Maple 18 real,
+O AlgebraKing reproduziu **257/257** verificações de a bateria de referência,
 vinda de um projeto de pesquisa (todas as 257 conferências deram o mesmo veredito).
 
 Suítes de teste do repositório (executadas para escrever este guia):

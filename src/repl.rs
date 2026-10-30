@@ -90,7 +90,7 @@ pub fn run_repl() -> i32 {
     if let Some(h) = &hist {
         let _ = rl.load_history(h);
     }
-    println!("AlgebraKing {} - Maple-style symbolic math (SymPy engine). Type quit; to leave.", env!("CARGO_PKG_VERSION"));
+    println!("AlgebraKing {} - symbolic math (SymPy engine). Type quit; to leave.", env!("CARGO_PKG_VERSION"));
     let mut buffer = String::new();
     loop {
         let prompt = if buffer.is_empty() { "> " } else { "  " };

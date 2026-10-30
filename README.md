@@ -2,7 +2,7 @@
   <img src="assets/banner_Gold.png" alt="AlgebraKing" width="720">
 </p>
 
-<p align="center"><b>A Maple-style computer algebra system for the terminal, written from scratch, with an MCP server so Claude can check your calculations.</b></p>
+<p align="center"><b>A computer algebra system for the terminal, written from scratch, with an MCP server so Claude can check your calculations.</b></p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Rust-2021-orange?logo=rust" alt="Rust">
@@ -14,14 +14,17 @@
 
 ## Why
 
-If you know Maple, you already know AlgebraKing: `int(x^2, x);`, `dsolve`,
-`<<1|2>, <3|4>>`, `proc ... end proc`, `with(LinearAlgebra)` and `assuming` are parsed
-and evaluated the way you expect. The *language* (parser, evaluation rules,
-procedures, printing) is written in Rust; the *mathematics* is delegated to a SymPy
-engine behind Maple's function names and return conventions. The main use case is
-"conferir contas": Claude sends a step of your derivation to AlgebraKing through MCP
-and gets back `equal`, `not_equal` (with a counterexample) or `undetermined`. It is
-also a pleasant command-line CAS on its own.
+AlgebraKing is a computer algebra system for the terminal, inspired by the Maple
+language and written from scratch (clean room: no Maple code, binaries or documentation
+were used). It reproduced 257/257 verdicts of a real verification suite originally run in
+Maple 18. Statements such as `int(x^2, x);`, `dsolve`, `<<1|2>, <3|4>>`,
+`proc ... end proc`, `with(LinearAlgebra)` and `assuming` are parsed and evaluated as
+written. The *language* (parser, evaluation rules, procedures, printing) is written in
+Rust; the *mathematics* is delegated to a SymPy engine behind AlgebraKing's function
+names and return conventions. The main use case is "conferir contas": Claude sends a
+step of your derivation to AlgebraKing through MCP and gets back `equal`, `not_equal`
+(with a counterexample) or `undetermined`. It is also a pleasant command-line CAS on
+its own.
 
 ## Install
 
@@ -40,7 +43,7 @@ Update with `git pull && ./install.sh`; remove with `./uninstall.sh`.
 
 ```text
 $ algebraking
-AlgebraKing 0.0.1 - Maple-style symbolic math (SymPy engine). Type quit; to leave.
+AlgebraKing 0.0.1 - symbolic math (SymPy engine). Type quit; to leave.
 > f := x -> x^2*exp(-x):
 > int(f(x), x=0..infinity);
 2
@@ -66,7 +69,7 @@ $ algebraking examples/calculus.mpl      # run a script
 
 | Area | What you get |
 |---|---|
-| Language | Maple syntax and precedence, `proc`/`end proc` with `local`/`option remember`, arrow procedures, `D`, `@`, `@@`, `if`/`for`/`while`, `try`/`catch`, `seq`/`add`/`mul`/`map`/`select`/`zip`, `%`, `read`, `with(pkg)` and `pkg:-f` |
+| Language | Operator precedence,  `proc`/`end proc` with `local`/`option remember`, arrow procedures, `D`, `@`, `@@`, `if`/`for`/`while`, `try`/`catch`, `seq`/`add`/`mul`/`map`/`select`/`zip`, `%`, `read`, `with(pkg)` and `pkg:-f` |
 | Algebra | `simplify`, `expand`, `factor` (with extensions), `normal`, `combine`, `collect`, `convert`, `evalc`, `rationalize`, polynomial tools (`gcd`, `resultant`, `Groebner[Basis]`, ...) |
 | Calculus | `diff`, `int`, `limit`, `series`/`taylor`, `sum`/`product`, `residue`, `implicitdiff`, `extrema`, `laplace`/`fourier`/`mellin` |
 | Solving | `solve`, `fsolve`, `isolve`, `rsolve`, `dsolve` (ODE and systems), `pdsolve` (basic), `odetest` |
@@ -76,7 +79,7 @@ $ algebraking examples/calculus.mpl      # run a script
 | Verification | `verify` machinery behind the MCP tools: symbolic first, then numeric, with counterexample |
 
 Anything that is not a language builtin goes to the engine, and unknown names come
-back unevaluated, as in Maple. See [docs/GUIA_USUARIO.md](docs/GUIA_USUARIO.md) for the
+back unevaluated. See the [user guide (PDF)](docs/USER_GUIDE.pdf) for the
 full catalogue with runnable examples.
 
 ## Use it with Claude (MCP)
@@ -92,7 +95,7 @@ Then ask Claude things like *"Confere se a derivada de x\*exp(x) é (x+1)\*exp(x
 
 | Tool | Arguments | Purpose |
 |---|---|---|
-| `algebra_eval` | `code`, `session?` | Run Maple statements in a persistent session; returns 1-D results plus LaTeX |
+| `algebra_eval` | `code`, `session?` | Run AlgebraKing statements in a persistent session; returns 1-D results plus LaTeX |
 | `verify_equal` | `lhs`, `rhs`, `assumptions?`, `field?`, `session?` | `equal` / `not_equal` / `undetermined` on the common domain, with its conditions (`x <> 1`, `abs(x) < 1`), domain comparison, in-domain counterexample, suggested assumption |
 | `check_derivative` | `f`, `derivative`, `var` | Is `diff(f, var)` the claimed derivative? |
 | `check_integral` | `integrand`, `antiderivative`, `var` | Does the antiderivative differentiate back to the integrand? |
@@ -104,11 +107,11 @@ Then ask Claude things like *"Confere se a derivada de x\*exp(x) é (x+1)\*exp(x
 `field` is `real` (default) or `complex`. `equal` means equal where both sides are
 defined: read the `conditions` and `domain` lines. A numeric `equal` is strong evidence,
 not a proof; the verdict always says which method decided. Claude Desktop setup and example prompts are in the
-[guide](docs/GUIA_USUARIO.md).
+[guide (PDF)](docs/USER_GUIDE.pdf).
 
 ## Documentation
 
-- [docs/GUIA_USUARIO.md](docs/GUIA_USUARIO.md): full user guide in Portuguese (install, language, math catalogue, MCP, differences from Maple, troubleshooting).
+- **User guide**: English [PDF](docs/USER_GUIDE.pdf) · [HTML](docs/USER_GUIDE.html) — Português [PDF](docs/GUIA_USUARIO.pdf) · [HTML](docs/GUIA_USUARIO.html). The HTML files are self-contained (download and open in a browser). Sources: [USER_GUIDE.md](docs/USER_GUIDE.md), [GUIA_USUARIO.md](docs/GUIA_USUARIO.md); rebuild with `python3 docs/manual/build_manual.py` (needs pandoc and LuaLaTeX).
 - [docs/design.md](docs/design.md): architecture, engine protocol, language rules, MCP design.
 
 ## Project layout
@@ -120,7 +123,7 @@ AlgebraKing/
   src/                       Rust: lexer, parser, interpreter, printer, engine client, REPL, MCP
   engine/engine.py           SymPy engine (embedded in the binary with include_str!)
   engine/test_engine.py      engine unit tests
-  tests/                     Rust integration tests + golden Maple scripts
+  tests/                     Rust integration tests + golden scripts
   examples/*.mpl             runnable examples
   assets/                    logos; make_logo.py regenerates them
   docs/                      user guide (pt-BR) and design notes
@@ -136,33 +139,6 @@ cargo test --release                      # Rust unit, CLI, golden and MCP tests
 python3 -m unittest engine/test_engine.py # SymPy engine tests
 ```
 
-Beyond the unit tests, AlgebraKing reproduced 257/257 verdicts of a real Maple 18
-verification suite taken from a research project (all checks passed).
-
 Environment variables: `ALGEBRAKING_PYTHON` (Python executable, default `python3`),
 `ALGEBRAKING_TIMEOUT` (seconds per engine call, default 60), `ALGEBRAKING_DEBUG`
 (forward the engine's stderr).
-
-## Clean room
-
-AlgebraKing contains no code, library, help text or data from Maple, and no Maple
-binary, library (`.mla`) or help database was opened, searched or decompiled while
-writing it. Compatibility comes only from Maple's public documentation and general
-knowledge of the language. Maple is a trademark of Waterloo Maple Inc.; this project
-is not affiliated with or endorsed by it.
-
-## Contributing
-
-Issues and pull requests are welcome: bug reports with a minimal `algebraking -e '...'`
-line that reproduces the problem are the most useful. Adding a function to the engine
-is one entry in the registry in `engine/engine.py` plus a test in
-`engine/test_engine.py`.
-
-## License
-
-MIT, see [LICENSE](LICENSE).
-
-## Credits
-
-Pedro H.F Matias, LEEDMOL-UFG. The wordmark uses the Neuropol typeface (Typodermic),
-rendered to PNG; the font file itself is not distributed.
