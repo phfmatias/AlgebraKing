@@ -2083,5 +2083,33 @@ class TestCheckSolution(RigorBase):
         self.assertIn('not established', r['completeness'])
 
 
+class TestEqualityAssumptions(RigorBase):
+    """assume d = -1 fixes the symbol; it used to be dropped while still listed as used (counterexample d = -1.9)."""
+
+    def test_fixed_symbol_is_substituted(self):
+        r = self.rv('R^6/(R^6+R0^6)', '(1 - d*(R0/R)^6)^(1/d)', assume=['0<R', '0<R0', 'd=-1'])
+        self.assertEqual(r['verdict'], 'equal', r)
+        self.assertNotIn('d', r.get('counterexample', {}))
+        self.assertEqual(r['assumptions_used'], ['R > 0', 'R0 > 0', 'd = -1'])
+        self.assertIn('d = -1', r['note'])
+
+    def test_value_on_the_left(self):
+        r = self.rv('x^n', '1/x', assume=['-1=n'])
+        self.assertEqual(r['verdict'], 'equal', r)
+
+    def test_wrong_value_is_still_caught(self):
+        r = self.rv('x^n', 'x^2', assume=['n=3'])
+        self.assertEqual(r['verdict'], 'not_equal', r)
+
+    def test_check_step_uses_the_value(self):
+        r = self.step('y = x^n', 'y = x^2', var='y', assume=['n=2'])
+        self.assertEqual(r['classification'], 'equivalent', r)
+
+    def test_unsupported_assumption_is_not_listed_as_used(self):
+        r = self.rv('x+y', 'y+x', assume=['x+y=1'])
+        self.assertEqual(r['assumptions_used'], [])
+        self.assertTrue(any('x+y = 1' in t for t in r['limitations']), r['limitations'])
+
+
 if __name__ == '__main__':
     unittest.main()

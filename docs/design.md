@@ -92,7 +92,11 @@ The engine is **stateless**. All session state travels in every request:
 `opts.digits` is the current value of Maple's `Digits` (default 10) and
 `opts.assume` is the list of assumptions active in the session (relations such as
 `lt[0,x]` from `assume(x>0)`, or `{"fn":"type","args":[x,{"sym":"integer"}]}` from
-`assume(x::integer)`). `verify` also accepts `opts`. Because of this, Rust may kill
+`assume(x::integer)`). `verify` also accepts `opts`. In `verify`, `check_step` and
+`check_solution` an equality `symbol = value` (`d = -1`) is substituted into the
+expressions before checking; an assumption of any other unsupported form (`x+y = 1`,
+`x <> 1`) is reported in `limitations` and left out of `assumptions_used`, never
+dropped silently. Because of this, Rust may kill
 and restart the engine at any time: each call has a timeout (env
 `ALGEBRAKING_TIMEOUT`, default 60 s); on timeout Rust kills the process, restarts it
 and reports `Error, (in name) computation timed out after N s`.

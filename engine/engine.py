@@ -306,6 +306,34 @@ TYPE_PROPS = {
 }
 
 
+def treeHasSym(e, name):
+    """True when the EXPR tree mentions the symbol name."""
+    if isinstance(e, list):
+        return any(treeHasSym(x, name) for x in e)
+    if isinstance(e, dict):
+        if e.get('sym') == name:
+            return True
+        return any(treeHasSym(v, name) for v in e.values())
+    return False
+
+
+def pinSyms(e, fixed):
+    """Replace every symbol fixed by an equality assumption (d = -1) by its value in an EXPR tree."""
+    if isinstance(e, list):
+        return [pinSyms(x, fixed) for x in e]
+    if isinstance(e, dict):
+        name = e.get('sym')
+        if isinstance(name, str) and name in fixed:
+            return fixed[name]
+        return {k: pinSyms(v, fixed) for k, v in e.items()}
+    return e
+
+
+# expression fields of the check requests where fixed symbols are substituted ('var' and 'candidates' are not)
+PIN_KEYS = ('lhs', 'rhs', 'lhs_raw', 'rhs_raw', 'before', 'after', 'before_raw', 'after_raw',
+            'equations', 'equations_raw')
+
+
 class Assumptions(object):
     """Turns the session's assume list into SymPy symbols with assumptions and sampling info."""
 
@@ -313,13 +341,15 @@ class Assumptions(object):
         self.props = {}
         self.bounds = {}
         self.cache = {}
+        self.fixed = {}      # symbol -> EXPR value, from equalities such as d = -1
+        self.ignored = []    # assumption nodes that could not be used
         plain = Convert(None, 10)
         self.plain = plain
         for it in items or []:
             try:
                 self.addNode(it)
             except (MapleError, KeyError, TypeError, ValueError, IndexError):
-                continue
+                self.ignored.append(it)
         self.finish()
 
     def symName(self, node):
@@ -368,6 +398,19 @@ class Assumptions(object):
                 for n in names:
                     if n:
                         self.addProps(n, TYPE_PROPS[tname])
+            else:
+                self.ignored.append(node)
+            return
+        if 'eq' in node:
+            # d = -1 (or -1 = d): the symbol is substituted before checking
+            a, b = node['eq']
+            sa, sb = self.symName(a), self.symName(b)
+            if sa and not treeHasSym(b, sa):
+                self.fixed[sa] = b
+            elif sb and not treeHasSym(a, sb):
+                self.fixed[sb] = a
+            else:
+                self.ignored.append(node)
             return
         for op in ('lt', 'le'):
             if op in node:
@@ -389,6 +432,8 @@ class Assumptions(object):
                 elif sa and sb:
                     self.addProps(sa, {'real': True})
                     self.addProps(sb, {'real': True})
+                else:
+                    self.ignored.append(node)
                 return
         if 'neq' in node:
             a, b = node['neq']
@@ -397,9 +442,13 @@ class Assumptions(object):
                 self.addProps(sa, {'nonzero': True})
             elif sb and self.numVal(a) == 0:
                 self.addProps(sb, {'nonzero': True})
+            else:
+                self.ignored.append(node)
             return
         if 'not' in node and isinstance(node['not'], dict) and 'eq' in node['not']:
             self.addNode({'neq': node['not']['eq']})
+            return
+        self.ignored.append(node)
 
     def finish(self):
         for name, b in self.bounds.items():
@@ -3703,8 +3752,14 @@ class RigorMixin(object):
         out.setdefault('method', 'numeric')
         out.setdefault('conditions', [])
         out.setdefault('limitations', [])
-        out['assumptions_used'] = self.assumeTexts(opts)
+        skipped = [exprText(n) for n in self.assume.ignored]
+        out['assumptions_used'] = [t for t in self.assumeTexts(opts) if t not in skipped]
+        for t in skipped:
+            out['limitations'].append('assumption ignored (form not supported): {}'.format(t))
         notes = [n for n in res.get('notes', []) if n]
+        if self.assume.fixed:
+            fixedText = ', '.join('{} = {}'.format(k, exprText(v)) for k, v in sorted(self.assume.fixed.items()))
+            notes.append('substituted before checking: {}'.format(fixedText))
         if notes:
             out['notes'] = notes
             out['note'] = '; '.join(notes)
@@ -6397,6 +6452,8 @@ class Engine(ArithMixin, CalculusMixin, SolveMixin, PolyMixin, NumberMixin, Misc
             return {'ok': True, 'result': {'str': 'pong'}}
         if op == 'call':
             return self.opCall(req)
+        if op in ('verify', 'check_step', 'check_solution'):
+            req = self.pinRequest(req)
         if op == 'verify':
             return self.opVerify(req)
         if op == 'check_step':
@@ -6408,6 +6465,22 @@ class Engine(ArithMixin, CalculusMixin, SolveMixin, PolyMixin, NumberMixin, Misc
         if op == 'pretty':
             return self.opPretty(req)
         return {'ok': False, 'error': 'unknown operation {}'.format(op)}
+
+    def pinRequest(self, req):
+        """Substitute the symbols fixed by an equality assumption (d = -1) in the expressions of a check request."""
+        fixed = Assumptions((req.get('opts') or {}).get('assume') or []).fixed
+        if not fixed:
+            return req
+        out = dict(req)
+        for k in PIN_KEYS:
+            if k in out:
+                # a few passes so that d = e, e = 2 reaches d -> 2; bounded in case of a cycle
+                for _ in range(len(fixed)):
+                    new = pinSyms(out[k], fixed)
+                    if new == out[k]:
+                        break
+                    out[k] = new
+        return out
 
     def opCall(self, req):
         name = req.get('name')
